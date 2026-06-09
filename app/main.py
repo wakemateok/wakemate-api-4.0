@@ -37,6 +37,48 @@ models.Base.metadata.create_all(bind=engine)
 app = FastAPI()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+class FCMTokenRequest(BaseModel):
+    user_id: int
+    fcm_token: str
+
+@app.post("/users/fcm-token")
+def save_fcm_token(data: FCMTokenRequest):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO user_fcm_tokens (user_id, fcm_token, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (user_id, fcm_token)
+        DO UPDATE SET
+            updated_at = NOW(),
+            is_active = TRUE;
+    """, (data.user_id, data.fcm_token))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "FCM token saved"}
+
+from pydantic import BaseModel
+from firebase_push import send_push_notification
+
+class TestPushRequest(BaseModel):
+    fcm_token: str
+
+@app.post("/test-push")
+def test_push(data: TestPushRequest):
+    response = send_push_notification(
+        fcm_token=data.fcm_token,
+        title="WAKEMATE 測試通知",
+        body="如果你看到這則通知，代表 FCM 成功。"
+    )
+
+    return {
+        "message": "push sent",
+        "firebase_response": response
+    }
 
 # 依賴注入：取得 DB session
 def get_db():

@@ -9,3 +9,4 @@ numpy==1.26.4
 apscheduler==3.10.4
 bcrypt==4.0.1
 passlib[bcrypt]==1.7.4
+firebase-admin
