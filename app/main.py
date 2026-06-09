@@ -62,7 +62,7 @@ def save_fcm_token(data: FCMTokenRequest):
     return {"message": "FCM token saved"}
 
 from pydantic import BaseModel
-from firebase_push import send_push_notification
+from app.firebase_push import send_push_notification
 
 class TestPushRequest(BaseModel):
     fcm_token: str
