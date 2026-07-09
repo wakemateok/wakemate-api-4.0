@@ -35,6 +35,11 @@ from core.alertness_data import run_alertness_data
 from core.database import get_db_connection
 
 models.Base.metadata.create_all(bind=engine)
+with engine.begin() as connection:
+    connection.execute(text("""
+        ALTER TABLE alertness_data_for_visualization
+        ADD COLUMN IF NOT EXISTS source_data_latest_at TIMESTAMPTZ
+    """))
 app = FastAPI()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
