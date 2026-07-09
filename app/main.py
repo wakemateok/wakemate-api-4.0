@@ -710,10 +710,17 @@ def get_pvt_results(user_id: UUID = Query(None), db: Session = Depends(get_db)):
 
 @app.get("/recommendations/", response_model=list[schemas.RecommendationsCaffeine_DB_Response])
 def get_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db)):
+    latest_source = (
+        db.query(func.max(RecommendationsCaffeine.source_data_latest_at))
+        .filter(RecommendationsCaffeine.user_id == user_id)
+        .filter(RecommendationsCaffeine.is_active == True)
+        .scalar_subquery()
+    )
     return (
         db.query(RecommendationsCaffeine)
         .filter(RecommendationsCaffeine.user_id == user_id)
         .filter(RecommendationsCaffeine.is_active == True)
+        .filter(RecommendationsCaffeine.source_data_latest_at == latest_source)
         .order_by(RecommendationsCaffeine.recommended_caffeine_intake_timing.asc())
         .all()
     )
