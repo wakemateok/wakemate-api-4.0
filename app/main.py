@@ -26,6 +26,7 @@ from .database import engine, SessionLocal
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
+import os
 from fastapi.responses import PlainTextResponse
 
 # 計算模組
@@ -36,6 +37,17 @@ from core.database import get_db_connection
 models.Base.metadata.create_all(bind=engine)
 app = FastAPI()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+class QuestionnaireLinksResponse(BaseModel):
+    chinese_baseline_url: str = ""
+    chinese_daily_url: str = ""
+    indonesian_baseline_url: str = ""
+    indonesian_daily_url: str = ""
+    # Backward-compatible aliases for older app builds.
+    chinese_url: str = ""
+    indonesian_url: str = ""
+    version: str = "v1"
 
 
 # 依賴注入：取得 DB session
@@ -60,15 +72,17 @@ app.add_middleware(
 # ------- 封裝共用觸發邏輯 -------
 # 即時觸發計算
 def trigger_calculation(triggered_by: UUID):
+    conn = None
     try:
         conn = get_db_connection()
         # 批次跑，內部會自動判斷每個 user_id 是否需要更新
-        run_caffeine_recommendation(conn)
-        run_alertness_data(conn)
-        conn.close()
+        recommendation_result = run_caffeine_recommendation(conn)
+        alertness_result = run_alertness_data(conn)
         return {
             "status": "ok",
-            "message": f"calculation batch finished (triggered by user {triggered_by})"
+            "message": f"calculation batch finished (triggered by user {triggered_by})",
+            "recommendation": recommendation_result,
+            "alertness": alertness_result,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -99,6 +113,31 @@ def ping(db: Session = Depends(get_db)):
         return {"status": "success", "message": "連線成功"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.get("/questionnaire_links/", response_model=QuestionnaireLinksResponse)
+def get_questionnaire_links():
+    chinese_baseline_url = (
+        os.getenv("QUESTIONNAIRE_ZH_BASELINE_URL", "").strip()
+        or os.getenv("QUESTIONNAIRE_ZH_URL", "").strip()
+    )
+    indonesian_baseline_url = (
+        os.getenv("QUESTIONNAIRE_ID_BASELINE_URL", "").strip()
+        or os.getenv("QUESTIONNAIRE_ID_URL", "").strip()
+    )
+
+    return QuestionnaireLinksResponse(
+        chinese_baseline_url=chinese_baseline_url,
+        chinese_daily_url=os.getenv("QUESTIONNAIRE_ZH_DAILY_URL", "").strip(),
+        indonesian_baseline_url=indonesian_baseline_url,
+        indonesian_daily_url=os.getenv("QUESTIONNAIRE_ID_DAILY_URL", "").strip(),
+        chinese_url=chinese_baseline_url,
+        indonesian_url=indonesian_baseline_url,
+        version=os.getenv("QUESTIONNAIRE_VERSION", "v1").strip() or "v1",
+    )
 
 
 # ========== API新增資料 ==========
@@ -673,6 +712,14 @@ def get_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db
         .order_by(RecommendationsCaffeine.recommended_caffeine_intake_timing.asc())
         .all()
     )
+
+
+@app.post("/calculate/")
+def calculate_recommendations(user_id: UUID = Query(...)):
+    result = trigger_calculation(user_id)
+    if result["status"] != "ok":
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
 
 
 @app.get("/alertness_data/", response_model=list[schemas.AlertnessData_DB_Response])

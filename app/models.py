@@ -140,6 +140,7 @@ class AlertnessDataForVisualization(Base):
     P_t_no_caffeine = Column(Float, nullable=True)
     P_t_real = Column(Float, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    source_data_latest_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="alertness_data")
 

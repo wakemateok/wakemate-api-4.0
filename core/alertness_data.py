@@ -278,15 +278,16 @@ def run_alertness_data(conn, user_params_map: Optional[Dict] = None):
 
             execute_values(cur, """
                 INSERT INTO alertness_data_for_visualization
-                (user_id, timestamp, awake, g_PD_rec, g_PD_real, P0_values,
-                 P_t_caffeine, P_t_no_caffeine, P_t_real, source_data_latest_at)
+                (user_id, "timestamp", awake, "g_PD_rec", "g_PD_real", "P0_values",
+                 "P_t_caffeine", "P_t_no_caffeine", "P_t_real", source_data_latest_at, updated_at)
                 VALUES %s
-            """, insert_rows)
+            """, [row + (latest_source_ts,) for row in insert_rows])
 
             conn.commit()
 
     except Exception as e:
         conn.rollback()
         print(f"執行清醒度數據計算時發生錯誤: {e}")
+        raise
     finally:
         cur.close()

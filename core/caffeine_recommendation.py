@@ -253,6 +253,8 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
     from uuid import uuid4
 
     cur = conn.cursor()
+    processed_users = 0
+    inserted_recommendations = 0
     try:
         # 載入使用者參數
         if user_params_map is None:
@@ -276,13 +278,17 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
         user_ids = _get_distinct_user_ids(cur)
         if not user_ids:
             print("沒有可處理的使用者（沒有清醒/睡眠資料）")
-            return
+            return {
+                "processed_users": 0,
+                "inserted_recommendations": 0,
+            }
 
         for uid in user_ids:
             latest_source_ts = _get_latest_source_ts(cur, uid)
             last_processed_ts = _get_last_processed_ts_for_rec(cur, uid)
             if latest_source_ts <= last_processed_ts:
                 continue
+            processed_users += 1
 
             params = user_params_map.get(
                 uid,
@@ -473,24 +479,26 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
                         """
                         INSERT INTO recommendations_caffeine
                         (user_id, recommended_caffeine_amount, recommended_caffeine_intake_timing,
-                         source_data_latest_at, run_id, is_active)
+                         source_data_latest_at, run_id, is_active, updated_at)
                         VALUES %s
-                        ON CONFLICT (user_id, recommended_caffeine_intake_timing)
-                        WHERE is_active = TRUE
-                        DO UPDATE SET
-                          recommended_caffeine_amount = EXCLUDED.recommended_caffeine_amount,
-                          source_data_latest_at = EXCLUDED.source_data_latest_at,
-                          run_id = EXCLUDED.run_id,
-                          is_active = TRUE,
-                          updated_at = NOW()
                         """,
-                        [(u, d, when, src_ts, this_run_id, True) for (u, d, when, src_ts) in values]
+                        [
+                            (u, int(round(d)), when, src_ts, this_run_id, True, db_now)
+                            for (u, d, when, src_ts) in values
+                        ]
                     )
+                    inserted_recommendations += len(values)
 
                     conn.commit()
+
+        return {
+            "processed_users": processed_users,
+            "inserted_recommendations": inserted_recommendations,
+        }
 
     except Exception as e:
         conn.rollback()
         print(f"執行咖啡因建議計算時發生錯誤: {e}")
+        raise
     finally:
         cur.close()
