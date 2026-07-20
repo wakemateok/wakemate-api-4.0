@@ -130,6 +130,7 @@ def get_all_intakes(cur, user_id):
           AND is_active = TRUE
           AND deleted_at IS NULL
           AND invalidated_at IS NULL
+          AND caffeine_amount BETWEEN 1 AND 500
         ORDER BY taking_timestamp
     """, (user_id,))
     return cur.fetchall()

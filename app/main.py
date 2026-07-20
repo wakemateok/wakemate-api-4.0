@@ -55,6 +55,95 @@ class QuestionnaireLinksResponse(BaseModel):
     version: str = "v1"
 
 
+MAX_SINGLE_CAFFEINE_MG = 500
+MAX_SLEEP_DURATION_HOURS = 48
+MAX_WAKE_DURATION_HOURS = 48
+MIN_PVT_MEAN_RT_MS = 100
+MAX_PVT_MEAN_RT_MS = 3000
+MAX_PVT_EVENT_COUNT = 100
+
+
+def _validate_time_range(
+    start: datetime | None,
+    end: datetime | None,
+    label: str,
+    max_hours: int,
+):
+    if start is None or end is None:
+        raise HTTPException(status_code=422, detail=f"{label}開始與結束時間皆為必填")
+    if not end > start:
+        raise HTTPException(status_code=400, detail=f"{label}結束時間必須晚於開始時間")
+
+    duration_hours = (end - start).total_seconds() / 3600
+    if duration_hours > max_hours:
+        raise HTTPException(status_code=400, detail=f"{label}時間長度不可超過 {max_hours} 小時")
+
+
+def _validate_caffeine_intake(drink_name: str | None, caffeine_amount: int | None):
+    if not drink_name or not drink_name.strip():
+        raise HTTPException(status_code=422, detail="飲品名稱不可空白")
+    if caffeine_amount is None:
+        raise HTTPException(status_code=422, detail="咖啡因含量為必填")
+    if caffeine_amount <= 0:
+        raise HTTPException(status_code=400, detail="咖啡因含量必須大於 0 mg")
+    if caffeine_amount > MAX_SINGLE_CAFFEINE_MG:
+        raise HTTPException(
+            status_code=400,
+            detail=f"單筆咖啡因含量不可超過 {MAX_SINGLE_CAFFEINE_MG} mg，請確認是否誤填或拆成多筆紀錄",
+        )
+
+
+def _validate_pvt_result(data: schemas.UsersPVTResultsCreate):
+    if not MIN_PVT_MEAN_RT_MS <= data.mean_rt <= MAX_PVT_MEAN_RT_MS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"清醒度測試平均反應時間需介於 {MIN_PVT_MEAN_RT_MS}-{MAX_PVT_MEAN_RT_MS} ms",
+        )
+    if data.lapses < 0 or data.false_starts < 0:
+        raise HTTPException(status_code=400, detail="清醒度測試錯誤次數不可為負數")
+    if data.lapses > MAX_PVT_EVENT_COUNT or data.false_starts > MAX_PVT_EVENT_COUNT:
+        raise HTTPException(status_code=400, detail="清醒度測試錯誤次數異常，請重新確認")
+    if data.kss_level is not None and not 1 <= data.kss_level <= 9:
+        raise HTTPException(status_code=400, detail="KSS 睡意分數需介於 1-9")
+    if not data.device or not data.device.strip():
+        raise HTTPException(status_code=422, detail="測試裝置不可空白")
+
+
+def _validate_recommendation_prerequisites(user_id: UUID, db: Session):
+    has_sleep = db.query(models.UsersRealSleepData.id).filter(
+        models.UsersRealSleepData.user_id == user_id,
+        models.UsersRealSleepData.is_active == True,
+        models.UsersRealSleepData.deleted_at.is_(None),
+        models.UsersRealSleepData.invalidated_at.is_(None),
+    ).first() is not None
+
+    has_wake = db.query(models.UsersTargetWakingPeriod.id).filter(
+        models.UsersTargetWakingPeriod.user_id == user_id,
+        models.UsersTargetWakingPeriod.is_active == True,
+        models.UsersTargetWakingPeriod.deleted_at.is_(None),
+        models.UsersTargetWakingPeriod.invalidated_at.is_(None),
+    ).first() is not None
+
+    missing_fields = []
+    if not has_sleep:
+        missing_fields.append("實際睡眠週期")
+    if not has_wake:
+        missing_fields.append("目標清醒時段")
+
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "無法產生咖啡因推薦，請先補齊必要資料",
+                "missing_fields": missing_fields,
+                "notes": [
+                    "咖啡因攝取紀錄可省略，省略時會視為沒有喝咖啡因。",
+                    "清醒度測試可省略，省略時會使用預設個人化參數。",
+                ],
+            },
+        )
+
+
 # 依賴注入：取得 DB session
 def get_db():
     db = SessionLocal()
@@ -234,6 +323,12 @@ def upsert_user_body_info(data: schemas.UsersBodyInfoCreate, db: Session = Depen
 
 @app.post("/users_sleep/", response_model=schemas.UsersRealSleepDataCreate_API_Response)
 def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depends(get_db)):
+    _validate_time_range(
+        data.sleep_start_time,
+        data.sleep_end_time,
+        "實際睡眠週期",
+        MAX_SLEEP_DURATION_HOURS,
+    )
     try:
         now = datetime.now(timezone.utc)
 
@@ -269,6 +364,12 @@ def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depe
 
 @app.post("/users_wake/", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
 def create_user_wake(data: schemas.UsersTargetWakingPeriodCreate, db: Session = Depends(get_db)):
+    _validate_time_range(
+        data.target_start_time,
+        data.target_end_time,
+        "目標清醒時段",
+        MAX_WAKE_DURATION_HOURS,
+    )
     try:
         now = datetime.now(timezone.utc)
 
@@ -303,6 +404,7 @@ def create_user_wake(data: schemas.UsersTargetWakingPeriodCreate, db: Session = 
 
 @app.post("/users_intake/", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
 def create_user_intake(data: schemas.UsersRealTimeIntakeCreate, db: Session = Depends(get_db)):
+    _validate_caffeine_intake(data.drink_name, data.caffeine_amount)
     try:
         now = datetime.now(timezone.utc)
 
@@ -338,6 +440,7 @@ def create_user_intake(data: schemas.UsersRealTimeIntakeCreate, db: Session = De
 from core.personalize_params import update_user_params
 @app.post("/users_pvt/", response_model=schemas.UsersPVTResultsCreate_API_Response)
 def create_user_pvt(data: schemas.UsersPVTResultsCreate, db: Session = Depends(get_db)):
+    _validate_pvt_result(data)
     try:
         entry = models.UsersPVTResults(**data.dict())
         db.add(entry)
@@ -459,6 +562,13 @@ def update_user_sleep(entry_id: int, data: schemas.UsersRealSleepDataUpdate, db:
         if not old_entry:
             raise HTTPException(status_code=404, detail="Sleep entry not found or already inactive")
 
+        _validate_time_range(
+            data.sleep_start_time,
+            data.sleep_end_time,
+            "實際睡眠週期",
+            MAX_SLEEP_DURATION_HOURS,
+        )
+
         now = datetime.now(timezone.utc)
 
         old_entry.is_active = False
@@ -543,6 +653,13 @@ def update_user_wake(entry_id: int, data: schemas.UsersTargetWakingPeriodUpdate,
         if not old_entry:
             raise HTTPException(status_code=404, detail="Wake entry not found or already inactive")
 
+        _validate_time_range(
+            data.target_start_time,
+            data.target_end_time,
+            "目標清醒時段",
+            MAX_WAKE_DURATION_HOURS,
+        )
+
         now = datetime.now(timezone.utc)
 
         old_entry.is_active = False
@@ -626,6 +743,8 @@ def update_user_intake(entry_id: int, data: schemas.UsersRealTimeIntakeUpdate, d
 
         if not old_entry:
             raise HTTPException(status_code=404, detail="Intake entry not found or already inactive")
+
+        _validate_caffeine_intake(data.drink_name, data.caffeine_amount)
 
         now = datetime.now(timezone.utc)
 
@@ -727,7 +846,8 @@ def get_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db
 
 
 @app.post("/calculate/")
-def calculate_recommendations(user_id: UUID = Query(...)):
+def calculate_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db)):
+    _validate_recommendation_prerequisites(user_id, db)
     result = trigger_calculation(user_id)
     if result["status"] != "ok":
         raise HTTPException(status_code=500, detail=result["message"])

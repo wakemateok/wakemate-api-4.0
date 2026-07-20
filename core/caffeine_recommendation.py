@@ -329,6 +329,7 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
                     AND is_active = TRUE
                     AND deleted_at IS NULL
                     AND invalidated_at IS NULL
+                    AND caffeine_amount BETWEEN 1 AND 500
                 ORDER BY taking_timestamp
             """, (uid,))
             caf_rows = cur.fetchall()  # list of (taking_timestamp, caffeine_amount)
