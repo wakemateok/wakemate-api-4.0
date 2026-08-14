@@ -79,6 +79,44 @@ def _validate_time_range(
         raise HTTPException(status_code=400, detail=f"{label}時間長度不可超過 {max_hours} 小時")
 
 
+def _validate_no_sleep_wake_overlap(
+    user_id: UUID,
+    start: datetime,
+    end: datetime,
+    record_type: str,
+    db: Session,
+):
+    if record_type == "sleep":
+        overlap = db.query(models.UsersTargetWakingPeriod.id).filter(
+            models.UsersTargetWakingPeriod.user_id == user_id,
+            models.UsersTargetWakingPeriod.is_active == True,
+            models.UsersTargetWakingPeriod.deleted_at.is_(None),
+            models.UsersTargetWakingPeriod.invalidated_at.is_(None),
+            models.UsersTargetWakingPeriod.target_start_time < end,
+            models.UsersTargetWakingPeriod.target_end_time > start,
+        ).first()
+    elif record_type == "wake":
+        overlap = db.query(models.UsersRealSleepData.id).filter(
+            models.UsersRealSleepData.user_id == user_id,
+            models.UsersRealSleepData.is_active == True,
+            models.UsersRealSleepData.deleted_at.is_(None),
+            models.UsersRealSleepData.invalidated_at.is_(None),
+            models.UsersRealSleepData.sleep_start_time < end,
+            models.UsersRealSleepData.sleep_end_time > start,
+        ).first()
+    else:
+        raise ValueError(f"Unsupported record type: {record_type}")
+
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Sleep time and target wake time cannot overlap.",
+                "type": "sleep_wake_overlap",
+            },
+        )
+
+
 def _validate_caffeine_intake(drink_name: str | None, caffeine_amount: int | None):
     if not drink_name or not drink_name.strip():
         raise HTTPException(status_code=422, detail="飲品名稱不可空白")
@@ -142,6 +180,30 @@ def _validate_recommendation_prerequisites(user_id: UUID, db: Session):
                 ],
             },
         )
+
+    sleep_rows = db.query(models.UsersRealSleepData).filter(
+        models.UsersRealSleepData.user_id == user_id,
+        models.UsersRealSleepData.is_active == True,
+        models.UsersRealSleepData.deleted_at.is_(None),
+        models.UsersRealSleepData.invalidated_at.is_(None),
+    ).all()
+    wake_rows = db.query(models.UsersTargetWakingPeriod).filter(
+        models.UsersTargetWakingPeriod.user_id == user_id,
+        models.UsersTargetWakingPeriod.is_active == True,
+        models.UsersTargetWakingPeriod.deleted_at.is_(None),
+        models.UsersTargetWakingPeriod.invalidated_at.is_(None),
+    ).all()
+
+    for sleep in sleep_rows:
+        for wake in wake_rows:
+            if wake.target_start_time < sleep.sleep_end_time and wake.target_end_time > sleep.sleep_start_time:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Sleep time and target wake time cannot overlap.",
+                        "type": "sleep_wake_overlap",
+                    },
+                )
 
 
 # 依賴注入：取得 DB session
@@ -207,9 +269,6 @@ def ping(db: Session = Depends(get_db)):
         return {"status": "success", "message": "連線成功"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 @app.get("/questionnaire_links/", response_model=QuestionnaireLinksResponse)
@@ -329,6 +388,13 @@ def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depe
         "實際睡眠週期",
         MAX_SLEEP_DURATION_HOURS,
     )
+    _validate_no_sleep_wake_overlap(
+        data.user_id,
+        data.sleep_start_time,
+        data.sleep_end_time,
+        "sleep",
+        db,
+    )
     try:
         now = datetime.now(timezone.utc)
 
@@ -369,6 +435,13 @@ def create_user_wake(data: schemas.UsersTargetWakingPeriodCreate, db: Session = 
         data.target_end_time,
         "目標清醒時段",
         MAX_WAKE_DURATION_HOURS,
+    )
+    _validate_no_sleep_wake_overlap(
+        data.user_id,
+        data.target_start_time,
+        data.target_end_time,
+        "wake",
+        db,
     )
     try:
         now = datetime.now(timezone.utc)
@@ -568,6 +641,13 @@ def update_user_sleep(entry_id: int, data: schemas.UsersRealSleepDataUpdate, db:
             "實際睡眠週期",
             MAX_SLEEP_DURATION_HOURS,
         )
+        _validate_no_sleep_wake_overlap(
+            old_entry.user_id,
+            data.sleep_start_time,
+            data.sleep_end_time,
+            "sleep",
+            db,
+        )
 
         now = datetime.now(timezone.utc)
 
@@ -658,6 +738,13 @@ def update_user_wake(entry_id: int, data: schemas.UsersTargetWakingPeriodUpdate,
             data.target_end_time,
             "目標清醒時段",
             MAX_WAKE_DURATION_HOURS,
+        )
+        _validate_no_sleep_wake_overlap(
+            old_entry.user_id,
+            data.target_start_time,
+            data.target_end_time,
+            "wake",
+            db,
         )
 
         now = datetime.now(timezone.utc)

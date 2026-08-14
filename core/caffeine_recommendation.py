@@ -32,6 +32,12 @@ def _get_distinct_user_ids(cursor):
             WHERE is_active = TRUE
             AND deleted_at IS NULL
             AND invalidated_at IS NULL
+
+            UNION
+
+            SELECT user_id
+            FROM recommendations_caffeine
+            WHERE is_active = TRUE
         ) AS u
     """)
     return [row[0] for row in cursor.fetchall()]
@@ -44,25 +50,16 @@ def _get_latest_source_ts(cursor, user_id):
                 SELECT MAX(updated_at)
                 FROM users_target_waking_period
                 WHERE user_id = %s
-                  AND is_active = TRUE
-                  AND deleted_at IS NULL
-                  AND invalidated_at IS NULL
             ), to_timestamp(0)),
             COALESCE((
                 SELECT MAX(updated_at)
                 FROM users_real_sleep_data
                 WHERE user_id = %s
-                  AND is_active = TRUE
-                  AND deleted_at IS NULL
-                  AND invalidated_at IS NULL
             ), to_timestamp(0)),
             COALESCE((
                 SELECT MAX(updated_at)
                 FROM users_real_time_intake
                 WHERE user_id = %s
-                  AND is_active = TRUE
-                  AND deleted_at IS NULL
-                  AND invalidated_at IS NULL
             ), to_timestamp(0))
         )
     """, (user_id, user_id, user_id))
@@ -290,6 +287,18 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
                 continue
             processed_users += 1
 
+            cur.execute("SELECT NOW()")
+            db_now = cur.fetchone()[0]
+            cur.execute("""
+                UPDATE recommendations_caffeine
+                SET is_active = FALSE,
+                    source_data_latest_at = %s,
+                    updated_at = %s
+                WHERE user_id = %s
+                  AND is_active = TRUE
+                  AND recommended_caffeine_intake_timing >= %s
+            """, (latest_source_ts, db_now, uid, db_now))
+
             params = user_params_map.get(
                 uid,
                 {"m_c": 1.0, "k_a": 1.25, "k_c": 0.20, "trait": 0.0, "p0_value": 270.0}
@@ -454,9 +463,6 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
 
             if all_insert_rows_merged:
                 # 只存未來
-                cur.execute("SELECT NOW()")
-                db_now = cur.fetchone()[0]
-
                 values = [(r[0], r[1], r[2], latest_source_ts) for r in all_insert_rows_merged]
                 values = [v for v in values if v[2] is not None and v[2] >= db_now]
 
@@ -465,14 +471,6 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
                     this_run_id = uuid4()
 
                     # 先把該 user 目前未來的 active 推薦全部關掉（保留歷史，不刪）
-                    cur.execute("""
-                        UPDATE recommendations_caffeine
-                        SET is_active = FALSE
-                        WHERE user_id = %s
-                          AND is_active = TRUE
-                          AND recommended_caffeine_intake_timing >= NOW()
-                    """, (uid,))
-
                     # 插入本次 run 的推薦：is_active=true + run_id
                     # 用「active unique index」做 conflict inference，避免插入被覆蓋導致全部 false
                     execute_values(
@@ -490,7 +488,7 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
                     )
                     inserted_recommendations += len(values)
 
-                    conn.commit()
+            conn.commit()
 
         return {
             "processed_users": processed_users,
