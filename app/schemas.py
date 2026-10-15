@@ -1,7 +1,7 @@
 # app/schemas.py
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from uuid import UUID
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import List, Optional
 
 # --- 使用者註冊 ---
@@ -56,6 +56,17 @@ class UsersBodyInfoResponse(BaseModel):
 
 
 # --- 使用者實際睡眠資料 ---
+class DayTimePeriod(BaseModel):
+    start: datetime
+    end: datetime
+
+
+class ReplaceDayRecords(BaseModel):
+    user_id: UUID
+    day: date
+    periods: List[DayTimePeriod] = Field(min_length=1, max_length=32)
+
+
 class UsersRealSleepDataCreate(BaseModel):
     user_id: UUID
     sleep_start_time: datetime

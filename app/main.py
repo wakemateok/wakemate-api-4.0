@@ -28,6 +28,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import os
 from fastapi.responses import PlainTextResponse
+from app.day_records import replace_day_records
+from app.pvt_records import save_pvt_result
 
 # 計算模組
 from core.caffeine_recommendation import run_caffeine_recommendation
@@ -242,6 +244,9 @@ def trigger_calculation(triggered_by: UUID):
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+    finally:
+        if conn is not None:
+            conn.close()
 
 # Scheduler 每小時補算
 def scheduled_job():
@@ -380,6 +385,20 @@ def upsert_user_body_info(data: schemas.UsersBodyInfoCreate, db: Session = Depen
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/users_sleep/replace_day")
+def replace_sleep_day(data: schemas.ReplaceDayRecords, db: Session = Depends(get_db)):
+    result = replace_day_records(db, data, "sleep")
+    result["calculation"] = trigger_calculation(data.user_id) if result["changed"] else {"status": "unchanged"}
+    return result
+
+
+@app.post("/users_wake/replace_day")
+def replace_wake_day(data: schemas.ReplaceDayRecords, db: Session = Depends(get_db)):
+    result = replace_day_records(db, data, "wake")
+    result["calculation"] = trigger_calculation(data.user_id) if result["changed"] else {"status": "unchanged"}
+    return result
+
+
 @app.post("/users_sleep/", response_model=schemas.UsersRealSleepDataCreate_API_Response)
 def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depends(get_db)):
     _validate_time_range(
@@ -515,15 +534,12 @@ from core.personalize_params import update_user_params
 def create_user_pvt(data: schemas.UsersPVTResultsCreate, db: Session = Depends(get_db)):
     _validate_pvt_result(data)
     try:
-        entry = models.UsersPVTResults(**data.dict())
-        db.add(entry)
-        db.commit()
-        db.refresh(entry)
+        entry_id = save_pvt_result(db, data)
 
         # 觸發個人化參數更新
         conn = get_db_connection()
         try:
-            params_update = update_user_params(conn, entry.user_id)
+            params_update = update_user_params(conn, data.user_id)
         except Exception as e:
             conn.rollback()
             raise
@@ -531,11 +547,11 @@ def create_user_pvt(data: schemas.UsersPVTResultsCreate, db: Session = Depends(g
             conn.close()
 
         # 依然觸發批次計算
-        calc_result = trigger_calculation(entry.user_id)
+        calc_result = trigger_calculation(data.user_id)
 
         return {
             "status": "success",
-            "id": entry.id,
+            "id": entry_id,
             "params_update": params_update,  # 🔹 已包含 p0_value, kc, trait
             "calculation": calc_result
         }
