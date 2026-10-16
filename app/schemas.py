@@ -6,9 +6,9 @@ from typing import List, Optional
 
 # --- 使用者註冊 ---
 class UserCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1, max_length=128)
 
 class UserResponse(BaseModel):
     user_id: UUID
@@ -21,7 +21,7 @@ class UserResponse(BaseModel):
 
 class UserLogin(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1, max_length=128)
 
 class UserLoginResponse(BaseModel):
     user_id: UUID
@@ -274,7 +274,7 @@ class DeviceHeartRate_DB_Response(BaseModel):
 
 
 class BulkHeartRate(BaseModel):
-    records: List[DeviceHeartRateDataCreate]
+    records: List[DeviceHeartRateDataCreate] = Field(min_length=1, max_length=1000)
 
 
 # ================== Device XYZ Time ==================
@@ -298,4 +298,4 @@ class DeviceXYZTime_DB_Response(BaseModel):
         from_attributes = True
 
 class BulkXYZTime(BaseModel):
-    records: List[DeviceXYZTimeDataCreate]
+    records: List[DeviceXYZTimeDataCreate] = Field(min_length=1, max_length=1000)

@@ -9,12 +9,16 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 BASE = "https://wakemate-api-4-0-qtgs.onrender.com"
+AUTH_TOKEN = None
 
 
 def call(path, payload=None, method=None):
+    headers = {"Content-Type": "application/json"}
+    if AUTH_TOKEN:
+        headers["Authorization"] = "Bearer " + AUTH_TOKEN
     request = Request(BASE + path, method=method or ("POST" if payload is not None else "GET"),
                       data=json.dumps(payload).encode() if payload is not None else None,
-                      headers={"Content-Type": "application/json"})
+                      headers=headers)
     try:
         with urlopen(request, timeout=120) as response:
             return response.status, json.loads(response.read())
@@ -23,15 +27,21 @@ def call(path, payload=None, method=None):
 
 
 def main():
+    global AUTH_TOKEN
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-cloud", action="store_true")
     if not parser.parse_args().run_cloud:
         parser.error("Explicit --run-cloud is required")
     token = uuid4().hex[:16]
+    email = "codex_mobile_" + token + "@example.com"
+    password = secrets.token_urlsafe(24)
     status, user = call("/users/", {"name": "codex_mobile_regression_" + token,
-        "email": "codex_mobile_" + token + "@example.com", "password": secrets.token_urlsafe(24)})
+        "email": email, "password": password})
     assert status == 200, "Synthetic user creation failed"
     user_id = user["user_id"]
+    status, pair = call("/login/", {"email": email, "password": password})
+    assert status == 200, "Synthetic user login failed"
+    AUTH_TOKEN = pair["access_token"]
     results = []
     zone = timezone(timedelta(hours=8))
     day = datetime.now(zone).date() + timedelta(days=2)
@@ -46,6 +56,19 @@ def main():
     def passed(name):
         results.append(name)
         print(json.dumps({"passed": name}), flush=True)
+
+    status, own = call("/users/")
+    assert status == 200 and len(own) == 1 and own[0]["user_id"] == user_id
+    assert "hashed_password" not in own[0]
+    passed("authenticated_reads_are_owner_scoped")
+    status, _ = call("/users/?user_id=" + str(uuid4()))
+    assert status == 403
+    passed("cross_account_reads_are_forbidden")
+    AUTH_TOKEN = None
+    status, _ = call("/users/")
+    assert status == 401
+    passed("anonymous_reads_are_forbidden")
+    AUTH_TOKEN = pair["access_token"]
 
     try:
         sleep = payload((time(23, -1), time(7)))
@@ -96,6 +119,19 @@ def main():
             remaining += len(records)
         assert remaining == 0
         passed("synthetic_source_records_cleaned")
+        status, rotated = call("/auth/refresh", {"refresh_token": pair["refresh_token"]})
+        assert status == 200
+        status, _ = call("/auth/me")
+        assert status == 401
+        AUTH_TOKEN = rotated["access_token"]
+        status, _ = call("/auth/me")
+        assert status == 200
+        passed("refresh_rotates_and_invalidates_previous_access")
+        status, _ = call("/auth/logout", method="POST")
+        assert status == 200
+        status, _ = call("/auth/me")
+        assert status == 401
+        passed("logout_revokes_session")
     print(json.dumps({"passed_count": len(results), "results": results}))
 
 

@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.git
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+*.jks
+*.keystore
+*.p12
+*.pfx
+node_modules

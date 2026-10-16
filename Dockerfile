@@ -2,6 +2,7 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
 
@@ -14,5 +15,6 @@ RUN apt-get update && \
 
 COPY . .
 
+USER 10001:10001
 
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT"]

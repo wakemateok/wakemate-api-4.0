@@ -236,7 +236,7 @@ def _merge_recommendations_list(recs):
     return merged
 
 
-def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
+def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *, only_user_id=None):
     """
     user_params_map 格式:
       { user_id: {"m_c": float, "k_a": float, "k_c": float, "trait": float, "p0_value": float}, ... }
@@ -257,10 +257,13 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
         if user_params_map is None:
             user_params_map = {}
             try:
-                cur.execute("""
+                query = """
                     SELECT user_id, m_c, k_a, k_c, trait_alertness, p0_value
-                    FROM users_params;
-                """)
+                    FROM users_params
+                """
+                if only_user_id is not None:
+                    query += " WHERE user_id = %s"
+                cur.execute(query, (only_user_id,) if only_user_id is not None else None)
                 for r in cur.fetchall():
                     user_params_map[r[0]] = {
                         "m_c": float(r[1]) if r[1] is not None else 1.0,
@@ -272,7 +275,7 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None):
             except Exception:
                 user_params_map = {}
 
-        user_ids = _get_distinct_user_ids(cur)
+        user_ids = [only_user_id] if only_user_id is not None else _get_distinct_user_ids(cur)
         if not user_ids:
             print("沒有可處理的使用者（沒有清醒/睡眠資料）")
             return {

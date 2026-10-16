@@ -1,5 +1,7 @@
 # app/main.py
-from fastapi import FastAPI, HTTPException, Depends, Query, status
+from fastapi import APIRouter, FastAPI, HTTPException, Depends, Query, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text, desc
 from sqlalchemy.dialects.postgresql import insert
@@ -21,8 +23,8 @@ from app.models import (
 from app.schemas import UserLogin
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4, UUID
-from passlib.context import CryptContext
-from .database import engine, SessionLocal
+from .database import engine, SessionLocal, get_db
+from .auth import router as auth_router, enforce_data_owner, scoped_user_id, cleanup_expired_sessions
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
@@ -36,14 +38,9 @@ from core.caffeine_recommendation import run_caffeine_recommendation
 from core.alertness_data import run_alertness_data
 from core.database import get_db_connection
 
-models.Base.metadata.create_all(bind=engine)
-with engine.begin() as connection:
-    connection.execute(text("""
-        ALTER TABLE alertness_data_for_visualization
-        ADD COLUMN IF NOT EXISTS source_data_latest_at TIMESTAMPTZ
-    """))
 app = FastAPI()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+protected = APIRouter(dependencies=[Depends(enforce_data_owner)])
+app.include_router(auth_router)
 
 
 class QuestionnaireLinksResponse(BaseModel):
@@ -208,23 +205,33 @@ def _validate_recommendation_prerequisites(user_id: UUID, db: Session):
                 )
 
 
-# 依賴注入：取得 DB session
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
 # cors中間件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[value.strip() for value in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if value.strip()],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.middleware("http")
+async def private_responses(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, error: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": [
+        {"loc": list(item["loc"]), "msg": item["msg"], "type": item["type"]}
+        for item in error.errors()
+    ]})
 
 
 # ------- 封裝共用觸發邏輯 -------
@@ -234,8 +241,8 @@ def trigger_calculation(triggered_by: UUID):
     try:
         conn = get_db_connection()
         # 批次跑，內部會自動判斷每個 user_id 是否需要更新
-        recommendation_result = run_caffeine_recommendation(conn)
-        alertness_result = run_alertness_data(conn)
+        recommendation_result = run_caffeine_recommendation(conn, only_user_id=triggered_by)
+        alertness_result = run_alertness_data(conn, only_user_id=triggered_by)
         return {
             "status": "ok",
             "message": f"calculation batch finished (triggered by user {triggered_by})",
@@ -243,13 +250,15 @@ def trigger_calculation(triggered_by: UUID):
             "alertness": alertness_result,
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "calculation_failed"}
     finally:
         if conn is not None:
             conn.close()
 
 # Scheduler 每小時補算
 def scheduled_job():
+    with SessionLocal() as session:
+        cleanup_expired_sessions(session)
     conn = get_db_connection()
     try:
         run_caffeine_recommendation(conn)  # 全部使用者
@@ -260,8 +269,18 @@ def scheduled_job():
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(scheduled_job, "interval", hours=1)
-scheduler.start()
-atexit.register(lambda: scheduler.shutdown())
+@app.on_event("startup")
+def startup():
+    models.Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        cleanup_expired_sessions(session)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as connection:
+            connection.execute(text("""ALTER TABLE alertness_data_for_visualization
+                ADD COLUMN IF NOT EXISTS source_data_latest_at TIMESTAMPTZ"""))
+    if os.getenv("RUN_BACKGROUND_JOBS", "true").lower() == "true" and not scheduler.running:
+        scheduler.start()
+atexit.register(lambda: scheduler.shutdown() if scheduler.running else None)
 
 @app.head("/")
 def head_root():
@@ -273,7 +292,7 @@ def ping(db: Session = Depends(get_db)):
         db.execute(text("SELECT 1"))
         return {"status": "success", "message": "連線成功"}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(503, "database_unavailable")
 
 
 @app.get("/questionnaire_links/", response_model=QuestionnaireLinksResponse)
@@ -299,70 +318,10 @@ def get_questionnaire_links():
 
 
 # ========== API新增資料 ==========
-@app.post("/users/", response_model=schemas.UserResponse)
-def register_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(models.User).filter(models.User.email == user.email).first()
-    if db_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    hashed_password = pwd_context.hash(user.password)
-    new_user = models.User(
-        user_id=uuid4(),
-        email=user.email,
-        hashed_password=hashed_password,
-        name=user.name
-    )
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-
-    # 建立 users_params
-    # 預設參數 (dict 格式)
-    default_values = {
-        "m_c": 1.0,
-        "k_a": 1.25,
-        "k_c": 0.20,
-        "trait_alertness": 0.0,
-        "p0_value": 270.0,
-        "pvt_count_7d": 0
-    }
-
-    # 確保 users_params 有正確的預設值
-    existing_params = db.query(models.UsersParams).filter_by(user_id=new_user.user_id).first()
-    if not existing_params:
-        db.add(models.UsersParams(user_id=new_user.user_id, **default_values))
-    else:
-        for k, v in default_values.items():
-            setattr(existing_params, k, v)
-
-    db.commit()
-
-
-    return schemas.UserResponse.from_orm(new_user)
-
-
-
-@app.post("/login/", response_model=schemas.UserLoginResponse)
-def login_user(user: UserLogin, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.email == user.email).first()
-    if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
-        )
-
-    # 更新最後登入時間
-    db_user.last_login = func.now()
-    db.commit()
-    db.refresh(db_user)
-
-    return db_user
-
-
-@app.post("/users_body_info/", response_model=schemas.UsersBodyInfoResponse)
+@protected.post("/users_body_info/", response_model=schemas.UsersBodyInfoResponse)
 def upsert_user_body_info(data: schemas.UsersBodyInfoCreate, db: Session = Depends(get_db)):
     try:
-        stmt = insert(UsersBodyInfo).values(**data.dict())
+        stmt = insert(UsersBodyInfo).values(**data.model_dump())
         stmt = stmt.on_conflict_do_update(
             index_elements=[UsersBodyInfo.user_id],
             set_={
@@ -382,24 +341,24 @@ def upsert_user_body_info(data: schemas.UsersBodyInfoCreate, db: Session = Depen
         return updated_info
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
 
-@app.post("/users_sleep/replace_day")
+@protected.post("/users_sleep/replace_day")
 def replace_sleep_day(data: schemas.ReplaceDayRecords, db: Session = Depends(get_db)):
     result = replace_day_records(db, data, "sleep")
     result["calculation"] = trigger_calculation(data.user_id) if result["changed"] else {"status": "unchanged"}
     return result
 
 
-@app.post("/users_wake/replace_day")
+@protected.post("/users_wake/replace_day")
 def replace_wake_day(data: schemas.ReplaceDayRecords, db: Session = Depends(get_db)):
     result = replace_day_records(db, data, "wake")
     result["calculation"] = trigger_calculation(data.user_id) if result["changed"] else {"status": "unchanged"}
     return result
 
 
-@app.post("/users_sleep/", response_model=schemas.UsersRealSleepDataCreate_API_Response)
+@protected.post("/users_sleep/", response_model=schemas.UsersRealSleepDataCreate_API_Response)
 def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depends(get_db)):
     _validate_time_range(
         data.sleep_start_time,
@@ -443,11 +402,11 @@ def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depe
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
 
 
-@app.post("/users_wake/", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
+@protected.post("/users_wake/", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
 def create_user_wake(data: schemas.UsersTargetWakingPeriodCreate, db: Session = Depends(get_db)):
     _validate_time_range(
         data.target_start_time,
@@ -491,10 +450,10 @@ def create_user_wake(data: schemas.UsersTargetWakingPeriodCreate, db: Session = 
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
 
-@app.post("/users_intake/", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
+@protected.post("/users_intake/", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
 def create_user_intake(data: schemas.UsersRealTimeIntakeCreate, db: Session = Depends(get_db)):
     _validate_caffeine_intake(data.drink_name, data.caffeine_amount)
     try:
@@ -527,10 +486,10 @@ def create_user_intake(data: schemas.UsersRealTimeIntakeCreate, db: Session = De
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
 from core.personalize_params import update_user_params
-@app.post("/users_pvt/", response_model=schemas.UsersPVTResultsCreate_API_Response)
+@protected.post("/users_pvt/", response_model=schemas.UsersPVTResultsCreate_API_Response)
 def create_user_pvt(data: schemas.UsersPVTResultsCreate, db: Session = Depends(get_db)):
     _validate_pvt_result(data)
     try:
@@ -558,7 +517,7 @@ def create_user_pvt(data: schemas.UsersPVTResultsCreate, db: Session = Depends(g
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
 
 # ========== 取得資料 ==========
@@ -567,31 +526,31 @@ def read_root():
     return {"message": "API is running with APScheduler + real-time triggers"}
 
 
-@app.get("/users/")
-def get_users(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/users/", response_model=list[schemas.UserResponse])
+def get_users(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(User)
     if user_id:
         query = query.filter(User.user_id == user_id)
     return query.all()
 
 
-@app.get("/login/")
-def get_users_login(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/login/", response_model=list[schemas.UserLoginResponse])
+def get_users_login(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(User)
     if user_id:
         query = query.filter(User.user_id == user_id)
     return query.all()
 
-@app.get("/users_body_info/", response_model=list[schemas.UsersBodyInfoResponse])
-def get_users_body_info(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/users_body_info/", response_model=list[schemas.UsersBodyInfoResponse])
+def get_users_body_info(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(UsersBodyInfo)
     if user_id:
         query = query.filter(UsersBodyInfo.user_id == user_id)
     return query.all()
 
 
-@app.get("/users_sleep/", response_model=list[schemas.UsersRealSleepData_DB_Response])
-def get_sleep_data(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/users_sleep/", response_model=list[schemas.UsersRealSleepData_DB_Response])
+def get_sleep_data(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(models.UsersRealSleepData).filter(
         models.UsersRealSleepData.is_active == True,
         models.UsersRealSleepData.deleted_at.is_(None),
@@ -606,8 +565,8 @@ def get_sleep_data(user_id: UUID = Query(None), db: Session = Depends(get_db)):
     return query.all()
 
 
-@app.get("/users_wake/", response_model=list[schemas.UsersTargetWakingPeriod_DB_Response])
-def get_wake_target(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/users_wake/", response_model=list[schemas.UsersTargetWakingPeriod_DB_Response])
+def get_wake_target(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(models.UsersTargetWakingPeriod).filter(
         models.UsersTargetWakingPeriod.is_active == True,
         models.UsersTargetWakingPeriod.deleted_at.is_(None),
@@ -622,8 +581,8 @@ def get_wake_target(user_id: UUID = Query(None), db: Session = Depends(get_db)):
     return query.all()
 
 
-@app.get("/users_intake/", response_model=list[schemas.UsersRealTimeIntake_DB_Response])
-def get_intake_data(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/users_intake/", response_model=list[schemas.UsersRealTimeIntake_DB_Response])
+def get_intake_data(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(models.UsersRealTimeIntake).filter(
         models.UsersRealTimeIntake.is_active == True,
         models.UsersRealTimeIntake.deleted_at.is_(None),
@@ -638,7 +597,7 @@ def get_intake_data(user_id: UUID = Query(None), db: Session = Depends(get_db)):
     return query.all()
 
 # PUT 和 DELETE: 修改和刪除 sleep, wake, intake ================================================================================================
-@app.put("/users_sleep/{entry_id}", response_model=schemas.UsersRealSleepDataCreate_API_Response)
+@protected.put("/users_sleep/{entry_id}", response_model=schemas.UsersRealSleepDataCreate_API_Response)
 def update_user_sleep(entry_id: int, data: schemas.UsersRealSleepDataUpdate, db: Session = Depends(get_db)):
     try:
         old_entry = db.query(models.UsersRealSleepData).filter(
@@ -699,9 +658,9 @@ def update_user_sleep(entry_id: int, data: schemas.UsersRealSleepDataUpdate, db:
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
-@app.delete("/users_sleep/{entry_id}", response_model=schemas.UsersRealSleepDataCreate_API_Response)
+@protected.delete("/users_sleep/{entry_id}", response_model=schemas.UsersRealSleepDataCreate_API_Response)
 def delete_user_sleep(entry_id: int, db: Session = Depends(get_db)):
     try:
         entry = db.query(models.UsersRealSleepData).filter(
@@ -734,9 +693,9 @@ def delete_user_sleep(entry_id: int, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
     
-@app.put("/users_wake/{entry_id}", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
+@protected.put("/users_wake/{entry_id}", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
 def update_user_wake(entry_id: int, data: schemas.UsersTargetWakingPeriodUpdate, db: Session = Depends(get_db)):
     try:
         old_entry = db.query(models.UsersTargetWakingPeriod).filter(
@@ -797,9 +756,9 @@ def update_user_wake(entry_id: int, data: schemas.UsersTargetWakingPeriodUpdate,
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
-@app.delete("/users_wake/{entry_id}", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
+@protected.delete("/users_wake/{entry_id}", response_model=schemas.UsersTargetWakingPeriodCreate_API_Response)
 def delete_user_wake(entry_id: int, db: Session = Depends(get_db)):
     try:
         entry = db.query(models.UsersTargetWakingPeriod).filter(
@@ -832,9 +791,9 @@ def delete_user_wake(entry_id: int, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
-@app.put("/users_intake/{entry_id}", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
+@protected.put("/users_intake/{entry_id}", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
 def update_user_intake(entry_id: int, data: schemas.UsersRealTimeIntakeUpdate, db: Session = Depends(get_db)):
     try:
         old_entry = db.query(models.UsersRealTimeIntake).filter(
@@ -884,9 +843,9 @@ def update_user_intake(entry_id: int, data: schemas.UsersRealTimeIntakeUpdate, d
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
-@app.delete("/users_intake/{entry_id}", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
+@protected.delete("/users_intake/{entry_id}", response_model=schemas.UsersRealTimeIntakeCreate_API_Response)
 def delete_user_intake(entry_id: int, db: Session = Depends(get_db)):
     try:
         entry = db.query(models.UsersRealTimeIntake).filter(
@@ -919,19 +878,19 @@ def delete_user_intake(entry_id: int, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))            
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 # ================================================================================================
 
-@app.get("/users_pvt/", response_model=list[schemas.UsersPVTResults_DB_Response])
-def get_pvt_results(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/users_pvt/", response_model=list[schemas.UsersPVTResults_DB_Response])
+def get_pvt_results(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(UsersPVTResults)
     if user_id:
         query = query.filter(UsersPVTResults.user_id == user_id)
     return query.all()
 
 
-@app.get("/recommendations/", response_model=list[schemas.RecommendationsCaffeine_DB_Response])
-def get_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db)):
+@protected.get("/recommendations/", response_model=list[schemas.RecommendationsCaffeine_DB_Response])
+def get_recommendations(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     latest_source = (
         db.query(func.max(RecommendationsCaffeine.source_data_latest_at))
         .filter(RecommendationsCaffeine.user_id == user_id)
@@ -948,8 +907,8 @@ def get_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db
     )
 
 
-@app.post("/calculate/")
-def calculate_recommendations(user_id: UUID = Query(...), db: Session = Depends(get_db)):
+@protected.post("/calculate/")
+def calculate_recommendations(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     _validate_recommendation_prerequisites(user_id, db)
     result = trigger_calculation(user_id)
     if result["status"] != "ok":
@@ -957,8 +916,8 @@ def calculate_recommendations(user_id: UUID = Query(...), db: Session = Depends(
     return result
 
 
-@app.get("/alertness_data/", response_model=list[schemas.AlertnessData_DB_Response])
-def get_alertness_data(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/alertness_data/", response_model=list[schemas.AlertnessData_DB_Response])
+def get_alertness_data(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(AlertnessDataForVisualization)
     if user_id:
         query = query.filter(AlertnessDataForVisualization.user_id == user_id)
@@ -968,9 +927,9 @@ def get_alertness_data(user_id: UUID = Query(None), db: Session = Depends(get_db
 # ====================== 以下是 DEVICE 的資料批量傳送端口====================================
 
 # ================== 批量寫入 Heart Rate ==================
-@app.post("/device/heart_rate/bulk", response_model=list[schemas.DeviceHeartRate_DB_Response])
+@protected.post("/device/heart_rate/bulk", response_model=list[schemas.DeviceHeartRate_DB_Response])
 def create_heart_rate_bulk(payload: schemas.BulkHeartRate, db: Session = Depends(get_db)):
-    objs = [models.DeviceHeartRate(**record.dict()) for record in payload.records]
+    objs = [models.DeviceHeartRateData(**record.model_dump()) for record in payload.records]
     db.add_all(objs)
     db.commit()
     for obj in objs:
@@ -978,8 +937,8 @@ def create_heart_rate_bulk(payload: schemas.BulkHeartRate, db: Session = Depends
     return objs
 
 
-@app.get("/device/heart_rate", response_model=list[schemas.DeviceHeartRate_DB_Response])
-def get_heart_rate(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/device/heart_rate", response_model=list[schemas.DeviceHeartRate_DB_Response])
+def get_heart_rate(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(models.DeviceHeartRateData)
     if user_id:
         query = query.filter(models.DeviceHeartRateData.user_id == user_id)
@@ -987,10 +946,10 @@ def get_heart_rate(user_id: UUID = Query(None), db: Session = Depends(get_db)):
 
 
 # ================== 批量寫入 XYZ Time ==================
-@app.post("/device/xyz_time/bulk", response_model=list[schemas.DeviceXYZTime_DB_Response])
+@protected.post("/device/xyz_time/bulk", response_model=list[schemas.DeviceXYZTime_DB_Response])
 def create_xyz_time_bulk(payload: schemas.BulkXYZTime, db: Session = Depends(get_db)):
     try:
-        objs = [models.DeviceXYZTimeData(**record.dict()) for record in payload.records]
+        objs = [models.DeviceXYZTimeData(**record.model_dump()) for record in payload.records]
         db.add_all(objs)
         db.commit()
         for obj in objs:
@@ -998,12 +957,15 @@ def create_xyz_time_bulk(payload: schemas.BulkXYZTime, db: Session = Depends(get
         return objs
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"寫入失敗: {str(e)}")
+        raise HTTPException(status_code=500, detail="database_operation_failed")
 
 
-@app.get("/device/xyz_time", response_model=list[schemas.DeviceXYZTime_DB_Response])
-def get_xyz_time(user_id: UUID = Query(None), db: Session = Depends(get_db)):
+@protected.get("/device/xyz_time", response_model=list[schemas.DeviceXYZTime_DB_Response])
+def get_xyz_time(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
     query = db.query(models.DeviceXYZTimeData)
     if user_id:
         query = query.filter(models.DeviceXYZTimeData.user_id == user_id)
     return query.all()
+
+
+app.include_router(protected)

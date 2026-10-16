@@ -31,6 +31,33 @@ class User(Base):
     recommendations = relationship("RecommendationsCaffeine", back_populates="user")
     alertness_data = relationship("AlertnessDataForVisualization", back_populates="user")
 
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False, index=True)
+    access_hash = Column(String(64), nullable=False, unique=True, index=True)
+    refresh_hash = Column(String(64), nullable=False, unique=True, index=True)
+    access_expires_at = Column(DateTime(timezone=True), nullable=False)
+    refresh_expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    password_change_required = Column(Boolean, nullable=False, default=False)
+
+
+class UsedRefreshToken(Base):
+    __tablename__ = "auth_used_refresh_tokens"
+    token_hash = Column(String(64), primary_key=True)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("auth_sessions.id"), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AuthRateLimit(Base):
+    __tablename__ = "auth_rate_limits"
+    bucket = Column(String(64), primary_key=True)
+    count = Column(Integer, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class UsersBodyInfo(Base):
     __tablename__ = "users_body_info"
 
