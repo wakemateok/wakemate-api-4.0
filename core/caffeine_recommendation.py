@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from .baseline_rt import compute_baseline_rt
 from .period_validation import first_recommendation_overlap, utc
+from .time_context import taipei_time
 
 
 ALERTNESS_THRESHOLD = 270.0  # 目標上限（ms）
@@ -61,9 +62,11 @@ def _get_latest_source_ts(cursor, user_id):
                 SELECT MAX(updated_at)
                 FROM users_real_time_intake
                 WHERE user_id = %s
-            ), to_timestamp(0))
+            ), to_timestamp(0)),
+            COALESCE((SELECT MAX(updated_at) FROM users_pvt_results WHERE user_id = %s), to_timestamp(0)),
+            COALESCE((SELECT MAX(updated_at) FROM users_params WHERE user_id = %s), to_timestamp(0))
         )
-    """, (user_id, user_id, user_id))
+    """, (user_id, user_id, user_id, user_id, user_id))
     (ts,) = cursor.fetchone()
     return ts
 
@@ -229,7 +232,8 @@ def _merge_recommendations_list(recs):
             merged.append((uid_, dose_, when_))
             continue
         puid, pdose, pwhen = merged[-1]
-        if uid_ == puid and abs((when_ - pwhen).total_seconds()) <= MERGE_SECONDS:
+        if (uid_ == puid and taipei_time(when_).date() == taipei_time(pwhen).date()
+                and abs((when_ - pwhen).total_seconds()) <= MERGE_SECONDS):
             # merge into previous; keep earlier timestamp (pwhen)
             merged[-1] = (puid, pdose + dose_, pwhen)
         else:
@@ -363,6 +367,7 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
 
             # collect recommendations across all waking periods
             all_insert_rows = []
+            recommended_by_day = {}
 
             for _, target_start_time, target_end_time in waking_periods:
                 if utc(target_end_time) <= validation_now:
@@ -418,13 +423,18 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
                     except Exception:
                         pass
 
-                P_t = P0_values * g_PD
+                # Later windows must include doses already planned in earlier windows.
+                for _, amount, take_ts, _ in all_insert_rows:
+                    hour_idx = int((take_ts - period_start).total_seconds() // 3600)
+                    _apply_dose_to_gpd(g_PD, float(amount), hour_idx, m_c, k_a, k_c)
 
-                daily_dose = 0.0
+                P_t = P0_values * g_PD
                 intake_schedule = []
 
                 # iterate through all time points inside the target window
                 for i, now_dt in enumerate(time_index):
+                    if utc(now_dt) < utc(db_now):
+                        continue
                     # 只推薦在目標清醒區間內
                     if not (target_start_time <= now_dt <= target_end_time):
                         continue
@@ -454,13 +464,14 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
                         threshold=ALERTNESS_THRESHOLD
                     )
 
-                    remaining = MAX_DAILY_DOSE - daily_dose
+                    day = taipei_time(now_dt).date()
+                    remaining = MAX_DAILY_DOSE - recommended_by_day.get(day, 0.0)
                     dose_to_give = min(dose_needed, max(0.0, remaining))
                     if dose_to_give <= 0.0:
                         continue
 
                     intake_schedule.append((uid, dose_to_give, now_dt))
-                    daily_dose += dose_to_give
+                    recommended_by_day[day] = recommended_by_day.get(day, 0.0) + dose_to_give
 
                     # apply proposed dose forward on g_PD and refresh P_t
                     _apply_dose_to_gpd(g_PD, dose_to_give, i, m_c, k_a, k_c)

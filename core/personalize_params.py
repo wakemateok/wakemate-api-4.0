@@ -4,6 +4,8 @@ from datetime import timedelta
 from typing import Optional, Tuple, List
 from statistics import mean
 from .baseline_rt import compute_baseline_rt
+from .time_context import taipei_time
+from .period_validation import utc
 
 # Config / 超參數（可調）
 ALPHA_TRAIT = 0.12        # trait EMA learning rate (kss<=4)
@@ -157,7 +159,7 @@ def update_pvt_7d_stats(cur, user_id):
     avg = float(avg) if avg is not None else None
 
     cur.execute("""
-        SELECT COUNT(DISTINCT date_trunc('day', test_at))
+        SELECT COUNT(DISTINCT (test_at AT TIME ZONE 'Asia/Taipei')::date)
         FROM users_pvt_results
         WHERE user_id = %s
           AND test_at >= NOW() - INTERVAL '7 days'
@@ -174,12 +176,18 @@ def update_p0_for_user(conn, user_id,
                        min_days=MIN_DISTINCT_DAYS_7D):
     cur = conn.cursor()
     try:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ('personalize:' + str(user_id),))
         params = fetch_user_params(cur, user_id)
         cnt_7d, avg_7d, distinct_days = update_pvt_7d_stats(cur, user_id)
 
         rows = get_pvts_last_7days(cur, user_id)
         if not rows:
-            cur.close()
+            conn.commit()
+            return False
+
+        last_applied = params.get("last_trait_update")
+        if last_applied is not None and utc(last_applied) >= utc(rows[-1][0]):
+            conn.commit()
             return False
 
         sleep_intervals = get_all_sleep_intervals(cur, user_id)
@@ -189,7 +197,7 @@ def update_p0_for_user(conn, user_id,
             if not in_sleep:
                 filtered_rows.append((test_at, float(mean_rt), kss))
         if not filtered_rows:
-            cur.close()
+            conn.commit()
             return False
 
         # --- 補全不足 ---
@@ -205,10 +213,11 @@ def update_p0_for_user(conn, user_id,
             S = [r for r in filtered_rows if (r[2] is not None and r[2] >= 5)]
             used_alpha = alpha_fallback
             if not S:
+                conn.commit()
                 return False
 
         avg_mean_rt = mean([r[1] for r in S])
-        group_baselines = [270.0 + _sigmoid(r[0].hour) for r in S]
+        group_baselines = [270.0 + _sigmoid(taipei_time(r[0]).hour) for r in S]
         mean_group_baseline = mean(group_baselines)
         observed_trait = float(avg_mean_rt) - float(mean_group_baseline)
 

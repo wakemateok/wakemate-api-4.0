@@ -98,6 +98,12 @@ def main():
         assert len(timings) == len(set(timings))
         assert all(row['user_id'] == user_id and row['is_active'] for row in recommendations)
         passed('repeated_manual_calculation_keeps_one_active_recommendation_per_time')
+        totals = {}
+        for row in recommendations:
+            date = datetime.fromisoformat(row['recommended_caffeine_intake_timing'].replace('Z', '+00:00')).astimezone(zone).date()
+            totals[date] = totals.get(date, 0) + row['recommended_caffeine_amount']
+        assert all(amount <= 300 for amount in totals.values())
+        passed('recommendations_respect_existing_taipei_daily_budget')
 
         status, rejection = call("/users_wake/replace_day", payload((time(6), time(8)), (time(20), time(21))))
         assert status == 400
@@ -108,6 +114,14 @@ def main():
         status, active = call("/users_wake/?user_id=" + user_id)
         assert status == 200 and sorted(row["id"] for row in active) == sorted(first["ids"])
         passed("rejected_wake_replacement_preserves_all_originals")
+
+        status, rejected_edit = call('/users_wake/' + str(first['ids'][0]),
+            {'target_start_time': time(18), 'target_end_time': time(19)}, method='PUT')
+        assert status == 400 and rejected_edit['detail'] == 'periods_overlap'
+        passed('history_edit_cannot_overlap_another_wake_window')
+        status, active = call('/users_wake/?user_id=' + user_id)
+        assert status == 200 and sorted(row['id'] for row in active) == sorted(first['ids'])
+        passed('rejected_history_edit_preserves_original_records')
 
         status, _ = call("/users_sleep/replace_day", payload((time(23, -1), time(11))))
         assert status == 400
@@ -124,6 +138,9 @@ def main():
         status, retry = call("/users_pvt/", pvt)
         assert status == 200 and first["id"] == retry["id"]
         passed("pvt_retry_is_idempotent")
+        assert first['params_update']['p0_value'] == retry['params_update']['p0_value']
+        assert retry['params_update']['trait_updated'] is False
+        passed('pvt_retry_does_not_repeat_personalization_learning')
     finally:
         remaining = 0
         for endpoint in ("users_wake", "users_sleep"):

@@ -1,5 +1,6 @@
 # baseline_rt.py
 import numpy as np
+from .time_context import taipei_time
 
 # --- circadian ---
 def sigmoid(hour: int, L: float = 100.0, x0: float = 14.0, k: float = 0.2) -> float:
@@ -57,4 +58,4 @@ def compute_baseline_rt(t_obs, sleep_intervals, p0_value: float, trait: float = 
     if asleep:
         return base  # 睡眠期間你之後會設成 NaN/None，這裡仍回傳 base 方便一致
 
-    return base + sigmoid(t_obs.hour) + _sleep_debt_term_ms(t_obs, sleep_intervals)
+    return base + sigmoid(taipei_time(t_obs).hour) + _sleep_debt_term_ms(t_obs, sleep_intervals)

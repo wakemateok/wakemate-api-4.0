@@ -43,28 +43,21 @@ def _get_latest_source_ts(cursor, user_id):
                 SELECT MAX(updated_at)
                 FROM users_target_waking_period
                 WHERE user_id = %s
-                  AND is_active = TRUE
-                  AND deleted_at IS NULL
-                  AND invalidated_at IS NULL
             ), to_timestamp(0)),
             COALESCE((
                 SELECT MAX(updated_at)
                 FROM users_real_sleep_data
                 WHERE user_id = %s
-                  AND is_active = TRUE
-                  AND deleted_at IS NULL
-                  AND invalidated_at IS NULL
             ), to_timestamp(0)),
             COALESCE((
                 SELECT MAX(updated_at)
                 FROM users_real_time_intake
                 WHERE user_id = %s
-                  AND is_active = TRUE
-                  AND deleted_at IS NULL
-                  AND invalidated_at IS NULL
-            ), to_timestamp(0))
+            ), to_timestamp(0)),
+            COALESCE((SELECT MAX(updated_at) FROM users_pvt_results WHERE user_id = %s), to_timestamp(0)),
+            COALESCE((SELECT MAX(updated_at) FROM users_params WHERE user_id = %s), to_timestamp(0))
         )
-    """, (user_id, user_id, user_id))
+    """, (user_id, user_id, user_id, user_id, user_id))
     (ts,) = cursor.fetchone()
     return ts
 

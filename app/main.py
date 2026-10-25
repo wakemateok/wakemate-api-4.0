@@ -115,6 +115,23 @@ def _validate_no_sleep_wake_overlap(
         )
 
 
+def _validate_no_same_kind_overlap(user_id, start, end, kind, db, *, exclude_id=None):
+    model = models.UsersRealSleepData if kind == "sleep" else models.UsersTargetWakingPeriod
+    start_field = model.sleep_start_time if kind == "sleep" else model.target_start_time
+    end_field = model.sleep_end_time if kind == "sleep" else model.target_end_time
+    db.query(models.User).filter(models.User.user_id == user_id).with_for_update().first()
+    active = db.query(model).filter(
+        model.user_id == user_id, model.is_active.is_(True),
+        model.deleted_at.is_(None), model.invalidated_at.is_(None),
+    )
+    if exclude_id is not None:
+        if active.filter(model.id == exclude_id).populate_existing().first() is None:
+            raise HTTPException(404, detail="record_already_inactive")
+        active = active.filter(model.id != exclude_id)
+    if active.filter(start_field < end, end_field > start).first() is not None:
+        raise HTTPException(400, detail="periods_overlap")
+
+
 def _validate_caffeine_intake(drink_name: str | None, caffeine_amount: int | None):
     if not drink_name or not drink_name.strip():
         raise HTTPException(status_code=422, detail="飲品名稱不可空白")
@@ -230,7 +247,7 @@ async def private_responses(request: Request, call_next):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-WakeMate-Validation"] = "recommendation-scope-v3"
+    response.headers["X-WakeMate-Validation"] = "system-audit-v4"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
@@ -381,6 +398,7 @@ def create_user_sleep(data: schemas.UsersRealSleepDataCreate, db: Session = Depe
         "實際睡眠週期",
         MAX_SLEEP_DURATION_HOURS,
     )
+    _validate_no_same_kind_overlap(data.user_id, data.sleep_start_time, data.sleep_end_time, "sleep", db)
     _validate_no_sleep_wake_overlap(
         data.user_id,
         data.sleep_start_time,
@@ -429,6 +447,7 @@ def create_user_wake(data: schemas.UsersTargetWakingPeriodCreate, db: Session = 
         "目標清醒時段",
         MAX_WAKE_DURATION_HOURS,
     )
+    _validate_no_same_kind_overlap(data.user_id, data.target_start_time, data.target_end_time, "wake", db)
     _validate_no_sleep_wake_overlap(
         data.user_id,
         data.target_start_time,
@@ -631,6 +650,8 @@ def update_user_sleep(entry_id: int, data: schemas.UsersRealSleepDataUpdate, db:
             "實際睡眠週期",
             MAX_SLEEP_DURATION_HOURS,
         )
+        _validate_no_same_kind_overlap(old_entry.user_id, data.sleep_start_time, data.sleep_end_time,
+                                       "sleep", db, exclude_id=entry_id)
         _validate_no_sleep_wake_overlap(
             old_entry.user_id,
             data.sleep_start_time,
@@ -729,6 +750,8 @@ def update_user_wake(entry_id: int, data: schemas.UsersTargetWakingPeriodUpdate,
             "目標清醒時段",
             MAX_WAKE_DURATION_HOURS,
         )
+        _validate_no_same_kind_overlap(old_entry.user_id, data.target_start_time, data.target_end_time,
+                                       "wake", db, exclude_id=entry_id)
         _validate_no_sleep_wake_overlap(
             old_entry.user_id,
             data.target_start_time,
