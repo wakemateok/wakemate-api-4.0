@@ -21,6 +21,15 @@ class RecordEditAuditTests(unittest.TestCase):
     tearDown = authorization.AuthorizationTests.tearDown
     login = authorization.AuthorizationTests.login
 
+    def test_pvt_response_preserves_personalization_status_for_its_owner(self):
+        params = {'trait_updated': False, 'kc_updated': False, 'p0_value': 270.0}
+        with patch('app.main.get_db_connection'), patch('app.main.update_user_params', return_value=params):
+            result = self.client.post('/users_pvt/', headers=self.headers, json={
+                'user_id': str(self.a), 'mean_rt': 320, 'lapses': 1, 'false_starts': 0,
+                'kss_level': 3, 'device': 'Mobile', 'test_at': datetime.now(timezone.utc).isoformat()})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()['params_update'], params)
+
     def test_create_and_edit_cannot_overlap_the_same_record_type(self):
         day = (datetime.now(timezone.utc) + timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
         for kind in ['sleep', 'wake']:

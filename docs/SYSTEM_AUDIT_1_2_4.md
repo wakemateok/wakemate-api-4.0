@@ -12,6 +12,8 @@ See the frontend release's `docs/system_audit_1_2_4.md` for the full user-facing
   versions because timezone interpretation and bookkeeping are corrected. Clinical review is required.
 - The existing 300 mg budget is for new recommendations, not a new all-source clinical intake rule.
 - No participant-data migration, historic deletion or automatic parameter reset is performed.
+- The authenticated PVT response schema retains its intended per-owner personalization status,
+  so clients/tests can distinguish a new update from an unchanged replay.
 
 Tests include actual failed reproductions, 100 equivalent-instant comparisons, boundary/daily accounting,
 trait replay prevention, atomic edit rejection, and the existing scoped-history/authentication suites.

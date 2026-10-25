@@ -197,6 +197,7 @@ class UsersPVTResults_DB_Response(BaseModel):
 class UsersPVTResultsCreate_API_Response(BaseModel):
     status: str
     id: int
+    params_update: Optional[dict] = None
     calculation: dict  # trigger_calculation 回傳的結果
 
 
