@@ -84,9 +84,16 @@ def main():
         status, retry = call("/users_wake/replace_day", wake)
         assert status == 200 and retry["ids"] == first["ids"]
         passed("multi_slot_wake_retry_is_idempotent")
+        status, recommendations = call('/recommendations/?user_id=' + user_id)
+        assert status == 200 and isinstance(recommendations, list)
+        passed('consistent_inputs_allow_recommendation_reads')
 
-        status, _ = call("/users_wake/replace_day", payload((time(6), time(8)), (time(20), time(21))))
+        status, rejection = call("/users_wake/replace_day", payload((time(6), time(8)), (time(20), time(21))))
         assert status == 400
+        assert rejection['detail']['type'] == 'sleep_wake_overlap'
+        assert rejection['detail']['conflicts'][0]['sleep']['id'] is not None
+        assert datetime.fromisoformat(rejection['detail']['conflicts'][0]['sleep']['start']).astimezone(zone) == datetime.fromisoformat(time(23, -1))
+        passed('overlap_rejection_identifies_conflicting_periods')
         status, active = call("/users_wake/?user_id=" + user_id)
         assert status == 200 and sorted(row["id"] for row in active) == sorted(first["ids"])
         passed("rejected_wake_replacement_preserves_all_originals")
@@ -119,6 +126,9 @@ def main():
             remaining += len(records)
         assert remaining == 0
         passed("synthetic_source_records_cleaned")
+        status, unavailable = call('/recommendations/?user_id=' + user_id)
+        assert status == 400 and 'missing_fields' in unavailable['detail']
+        passed('missing_inputs_cannot_resurface_old_recommendations')
         status, rotated = call("/auth/refresh", {"refresh_token": pair["refresh_token"]})
         assert status == 200
         status, _ = call("/auth/me")
