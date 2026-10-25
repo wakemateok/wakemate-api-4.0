@@ -1,10 +1,10 @@
 # caffeine_recommendation.py
 import numpy as np
 from psycopg2.extras import execute_values
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from .baseline_rt import compute_baseline_rt
-from .period_validation import first_sleep_wake_overlap
+from .period_validation import first_recommendation_overlap, utc
 
 
 ALERTNESS_THRESHOLD = 270.0  # 目標上限（ms）
@@ -237,7 +237,7 @@ def _merge_recommendations_list(recs):
     return merged
 
 
-def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *, only_user_id=None):
+def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *, only_user_id=None, reference_time=None, force=False):
     """
     user_params_map 格式:
       { user_id: {"m_c": float, "k_a": float, "k_c": float, "trait": float, "p0_value": float}, ... }
@@ -253,6 +253,7 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
     cur = conn.cursor()
     processed_users = 0
     inserted_recommendations = 0
+    validation_now = utc(reference_time or datetime.now(timezone.utc))
     try:
         # 載入使用者參數
         if user_params_map is None:
@@ -285,6 +286,8 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
             }
 
         for uid in user_ids:
+            # Serialize retries across devices before replacing active recommendations.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (str(uid),))
             cur.execute("""
                 SELECT user_id, target_start_time, target_end_time
                 FROM users_target_waking_period
@@ -306,15 +309,16 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
                 ORDER BY sleep_start_time
             """, (uid,))
             sleep_rows = cur.fetchall()
-            if not sleep_rows or not waking_periods or first_sleep_wake_overlap(
-                [(r[1], r[2]) for r in sleep_rows], [(r[1], r[2]) for r in waking_periods]
+            if not sleep_rows or not waking_periods or first_recommendation_overlap(
+                [(r[1], r[2]) for r in sleep_rows], [(r[1], r[2]) for r in waking_periods], now=validation_now
             ) is not None:
                 cur.execute("UPDATE recommendations_caffeine SET is_active = FALSE WHERE user_id = %s AND is_active = TRUE AND recommended_caffeine_intake_timing >= NOW()", (uid,))
                 conn.commit()
                 continue
             latest_source_ts = _get_latest_source_ts(cur, uid)
             last_processed_ts = _get_last_processed_ts_for_rec(cur, uid)
-            if latest_source_ts <= last_processed_ts:
+            if not force and latest_source_ts <= last_processed_ts:
+                conn.commit()
                 continue
             processed_users += 1
 
@@ -361,6 +365,8 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
             all_insert_rows = []
 
             for _, target_start_time, target_end_time in waking_periods:
+                if utc(target_end_time) <= validation_now:
+                    continue
                 # =========================================================
                 # Continuous time_index (hourly) to support cross-day shifts
                 # =========================================================

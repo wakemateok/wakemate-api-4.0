@@ -32,7 +32,7 @@ import os
 from fastapi.responses import PlainTextResponse
 from app.day_records import replace_day_records
 from app.pvt_records import save_pvt_result
-from core.period_validation import first_sleep_wake_overlap, overlap_detail
+from core.period_validation import first_recommendation_overlap, overlap_detail
 
 # 計算模組
 from core.caffeine_recommendation import run_caffeine_recommendation
@@ -192,7 +192,7 @@ def _validate_recommendation_prerequisites(user_id: UUID, db: Session):
         models.UsersTargetWakingPeriod.invalidated_at.is_(None),
     ).all()
 
-    conflict = first_sleep_wake_overlap(
+    conflict = first_recommendation_overlap(
         [(row.sleep_start_time, row.sleep_end_time) for row in sleep_rows],
         [(row.target_start_time, row.target_end_time) for row in wake_rows],
     )
@@ -230,7 +230,7 @@ async def private_responses(request: Request, call_next):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-WakeMate-Validation"] = "sleep-wake-v2"
+    response.headers["X-WakeMate-Validation"] = "recommendation-scope-v3"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
@@ -245,7 +245,7 @@ async def validation_error(request: Request, error: RequestValidationError):
 
 # ------- 封裝共用觸發邏輯 -------
 # 即時觸發計算
-def trigger_calculation(triggered_by: UUID):
+def trigger_calculation(triggered_by: UUID, *, force=False):
     conn = None
     try:
         with SessionLocal() as validation_db:
@@ -256,8 +256,8 @@ def trigger_calculation(triggered_by: UUID):
                 return {"status": "blocked", "detail": error.detail}
         conn = get_db_connection()
         # 批次跑，內部會自動判斷每個 user_id 是否需要更新
-        recommendation_result = run_caffeine_recommendation(conn, only_user_id=triggered_by)
-        alertness_result = run_alertness_data(conn, only_user_id=triggered_by)
+        recommendation_result = run_caffeine_recommendation(conn, only_user_id=triggered_by, force=force)
+        alertness_result = run_alertness_data(conn, only_user_id=triggered_by, force=force)
         return {
             "status": "ok",
             "message": f"calculation batch finished (triggered by user {triggered_by})",
@@ -930,7 +930,7 @@ def calculate_recommendations(user_id: UUID = Depends(scoped_user_id), db: Sessi
     except HTTPException:
         _invalidate_future_recommendations(user_id, db)
         raise
-    result = trigger_calculation(user_id)
+    result = trigger_calculation(user_id, force=True)
     if result["status"] == "blocked":
         raise HTTPException(400, detail=result["detail"])
     if result["status"] != "ok":

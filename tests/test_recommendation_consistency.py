@@ -22,13 +22,13 @@ class RecommendationConsistencyTests(unittest.TestCase):
     login = authorization.AuthorizationTests.login
 
     def seed_conflict(self):
-        # A historical conflict can block recalculation of an unrelated new day.
+        self.day = (datetime.now(ZONE) + timedelta(days=2)).date()
+        def at(hour, minute=0, offset=0):
+            return datetime.combine(self.day + timedelta(days=offset), datetime.min.time(), ZONE).replace(hour=hour, minute=minute).astimezone(timezone.utc)
         self.sleep = models.UsersRealSleepData(user_id=self.a,
-            sleep_start_time=datetime(2026, 10, 20, 8, tzinfo=ZONE).astimezone(timezone.utc),
-            sleep_end_time=datetime(2026, 10, 20, 16, 30, tzinfo=ZONE).astimezone(timezone.utc))
+            sleep_start_time=at(8), sleep_end_time=at(16, 30))
         self.wake = models.UsersTargetWakingPeriod(user_id=self.a,
-            target_start_time=datetime(2026, 10, 20, 16, tzinfo=ZONE).astimezone(timezone.utc),
-            target_end_time=datetime(2026, 10, 20, 18, tzinfo=ZONE).astimezone(timezone.utc))
+            target_start_time=at(16), target_end_time=at(18))
         self.rec = models.RecommendationsCaffeine(user_id=self.a,
             recommended_caffeine_amount=50,
             recommended_caffeine_intake_timing=datetime.now(timezone.utc) + timedelta(days=2))
@@ -58,10 +58,11 @@ class RecommendationConsistencyTests(unittest.TestCase):
     def test_saved_valid_new_day_reports_saved_but_calculation_blocked(self):
         self.seed_conflict()
         self.calc_patch.stop()
+        day = (self.day + timedelta(days=1)).isoformat()
         with patch('app.main.SessionLocal', sessionmaker(bind=self.engine)), patch('app.main.get_db_connection') as connection:
             result = self.client.post('/users_wake/replace_day', headers=self.headers, json={
-                'user_id': str(self.a), 'day': '2026-10-25', 'periods': [{
-                    'start': '2026-10-25T16:00:00+08:00', 'end': '2026-10-25T18:00:00+08:00'}]})
+                'user_id': str(self.a), 'day': day, 'periods': [{
+                    'start': day + 'T16:00:00+08:00', 'end': day + 'T18:00:00+08:00'}]})
             self.assertEqual(result.status_code, 200, result.text)
             self.assertEqual(result.json()['status'], 'success')
             self.assertEqual(result.json()['calculation']['status'], 'blocked')
@@ -71,9 +72,10 @@ class RecommendationConsistencyTests(unittest.TestCase):
 
     def test_new_overlapping_input_is_rejected_atomically_with_conflict_details(self):
         self.seed_conflict()
+        day = self.day.isoformat()
         result = self.client.post('/users_wake/replace_day', headers=self.headers, json={
-            'user_id': str(self.a), 'day': '2026-10-20', 'periods': [{
-                'start': '2026-10-20T15:00:00+08:00', 'end': '2026-10-20T17:00:00+08:00'}]})
+            'user_id': str(self.a), 'day': day, 'periods': [{
+                'start': day + 'T15:00:00+08:00', 'end': day + 'T17:00:00+08:00'}]})
         self.assertEqual(result.status_code, 400)
         self.assertEqual(result.json()['detail']['conflicts'][0]['sleep']['id'], self.sleep.id)
         self.assertEqual(self.db.query(models.UsersTargetWakingPeriod).count(), 1)
@@ -83,14 +85,14 @@ class RecommendationConsistencyTests(unittest.TestCase):
         self.sleep.is_active = False
         self.sleep.invalidated_at = datetime.now(timezone.utc)
         self.db.add(models.UsersRealSleepData(user_id=self.a,
-            sleep_start_time=datetime(2026, 10, 19, 23, tzinfo=ZONE).astimezone(timezone.utc),
-            sleep_end_time=datetime(2026, 10, 20, 7, tzinfo=ZONE).astimezone(timezone.utc)))
+            sleep_start_time=datetime.combine(self.day - timedelta(days=1), datetime.min.time(), ZONE).replace(hour=23).astimezone(timezone.utc),
+            sleep_end_time=datetime.combine(self.day, datetime.min.time(), ZONE).replace(hour=7).astimezone(timezone.utc)))
         self.db.commit()
         self.assertEqual(self.client.get('/recommendations/', headers=self.headers).status_code, 200)
 
     def test_adjacent_sleep_end_and_wake_start_are_allowed(self):
         self.seed_conflict()
-        self.sleep.sleep_end_time = datetime(2026, 10, 20, 16, tzinfo=ZONE).astimezone(timezone.utc)
+        self.sleep.sleep_end_time = self.wake.target_start_time
         self.db.commit()
         self.assertEqual(self.client.post('/calculate/', headers=self.headers).status_code, 200)
 
@@ -118,7 +120,7 @@ class PeriodValidationTests(unittest.TestCase):
             def rollback(self): raise AssertionError('unexpected rollback')
         conn = Connection()
         with patch('core.caffeine_recommendation.execute_values') as write:
-            result = run_caffeine_recommendation(conn, {}, only_user_id='user')
+            result = run_caffeine_recommendation(conn, {}, only_user_id='user', reference_time=start)
             self.assertEqual(result['inserted_recommendations'], 0)
             write.assert_not_called()
         self.assertTrue(any('is_active = FALSE' in sql for sql in conn.cur.sql))

@@ -1,6 +1,6 @@
 """Shared half-open interval checks; adjacent periods are not conflicts."""
 
-from datetime import timezone
+from datetime import datetime, timezone
 
 
 def utc(value):
@@ -13,6 +13,16 @@ def first_sleep_wake_overlap(sleeps, wakes):
             if utc(wake_start) < utc(sleep_end) and utc(wake_end) > utc(sleep_start):
                 return sleep_index, wake_index
     return None
+
+
+def first_recommendation_overlap(sleeps, wakes, *, now=None):
+    """Only unfinished wake windows can block current/future recommendations."""
+    cutoff = utc(now or datetime.now(timezone.utc))
+    relevant = [(index, period) for index, period in enumerate(wakes) if utc(period[1]) > cutoff]
+    conflict = first_sleep_wake_overlap(sleeps, [period for _, period in relevant])
+    if conflict is None:
+        return None
+    return conflict[0], relevant[conflict[1]][0]
 
 
 def overlap_detail(sleep_start, sleep_end, wake_start, wake_end, *, sleep_id=None, wake_id=None):

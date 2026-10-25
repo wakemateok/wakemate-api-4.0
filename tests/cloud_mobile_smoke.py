@@ -88,6 +88,17 @@ def main():
         assert status == 200 and isinstance(recommendations, list)
         passed('consistent_inputs_allow_recommendation_reads')
 
+        for _ in range(2):
+            status, calculated = call('/calculate/?user_id=' + user_id, method='POST')
+            assert status == 200 and calculated['status'] == 'ok'
+        passed('manual_retries_perform_real_calculation')
+        status, recommendations = call('/recommendations/?user_id=' + user_id)
+        assert status == 200 and recommendations
+        timings = [row['recommended_caffeine_intake_timing'] for row in recommendations]
+        assert len(timings) == len(set(timings))
+        assert all(row['user_id'] == user_id and row['is_active'] for row in recommendations)
+        passed('repeated_manual_calculation_keeps_one_active_recommendation_per_time')
+
         status, rejection = call("/users_wake/replace_day", payload((time(6), time(8)), (time(20), time(21))))
         assert status == 400
         assert rejection['detail']['type'] == 'sleep_wake_overlap'

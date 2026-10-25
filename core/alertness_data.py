@@ -4,7 +4,7 @@ from datetime import timedelta
 from psycopg2.extras import execute_values
 from typing import Dict, Optional
 from .baseline_rt import compute_baseline_rt
-from .period_validation import first_sleep_wake_overlap
+from .period_validation import first_recommendation_overlap
 
 
 def _get_user_ids_for_alertness(cursor):
@@ -79,7 +79,7 @@ def _get_last_processed_ts_for_alert(cursor, user_id):
     return ts
 
 
-def run_alertness_data(conn, user_params_map: Optional[Dict] = None, *, only_user_id=None):
+def run_alertness_data(conn, user_params_map: Optional[Dict] = None, *, only_user_id=None, reference_time=None, force=False):
     """
     若傳入 user_params_map，格式:
       { user_id: {"m_c": float, "k_a": float, "k_c": float, "trait": float, "p0_value": float}, ... }
@@ -123,7 +123,7 @@ def run_alertness_data(conn, user_params_map: Optional[Dict] = None, *, only_use
             latest_source_ts = _get_latest_source_ts(cur, uid)
             last_processed_ts = _get_last_processed_ts_for_alert(cur, uid)
 
-            if latest_source_ts <= last_processed_ts:
+            if not force and latest_source_ts <= last_processed_ts:
                 continue
 
             # 只抓有效 sleep
@@ -152,7 +152,7 @@ def run_alertness_data(conn, user_params_map: Optional[Dict] = None, *, only_use
 
             if not sleep_rows or not target_rows:
                 continue
-            if first_sleep_wake_overlap(sleep_rows, target_rows) is not None:
+            if first_recommendation_overlap(sleep_rows, target_rows, now=reference_time) is not None:
                 continue
 
             # 只抓有效 real intake
