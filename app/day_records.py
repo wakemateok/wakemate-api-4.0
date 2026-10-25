@@ -5,6 +5,7 @@ from datetime import datetime, time, timedelta, timezone
 from fastapi import HTTPException
 
 from app import models
+from core.period_validation import overlap_detail
 
 
 TAIPEI = timezone(timedelta(hours=8))
@@ -58,7 +59,7 @@ def replace_day_records(db, request, kind):
         old = active.filter(day_field >= begin, day_field < finish).order_by(model.id).all()
 
         for start, end in periods:
-            conflict = db.query(other.id).filter(
+            conflict = db.query(other).filter(
                 other.user_id == request.user_id,
                 other.is_active.is_(True),
                 other.deleted_at.is_(None),
@@ -67,7 +68,8 @@ def replace_day_records(db, request, kind):
                 getattr(other, other_end) > start,
             ).first()
             if conflict:
-                raise HTTPException(400, detail="sleep_wake_overlap")
+                detail = overlap_detail(start, end, conflict.target_start_time, conflict.target_end_time, wake_id=conflict.id) if kind == "sleep" else overlap_detail(conflict.sleep_start_time, conflict.sleep_end_time, start, end, sleep_id=conflict.id)
+                raise HTTPException(400, detail=detail)
             outside_conflict = active.filter(
                 ~model.id.in_([entry.id for entry in old]),
                 getattr(model, start_name) < end,

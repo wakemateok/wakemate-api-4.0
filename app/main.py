@@ -32,6 +32,7 @@ import os
 from fastapi.responses import PlainTextResponse
 from app.day_records import replace_day_records
 from app.pvt_records import save_pvt_result
+from core.period_validation import first_sleep_wake_overlap, overlap_detail
 
 # 計算模組
 from core.caffeine_recommendation import run_caffeine_recommendation
@@ -86,7 +87,7 @@ def _validate_no_sleep_wake_overlap(
     db: Session,
 ):
     if record_type == "sleep":
-        overlap = db.query(models.UsersTargetWakingPeriod.id).filter(
+        overlap = db.query(models.UsersTargetWakingPeriod).filter(
             models.UsersTargetWakingPeriod.user_id == user_id,
             models.UsersTargetWakingPeriod.is_active == True,
             models.UsersTargetWakingPeriod.deleted_at.is_(None),
@@ -95,7 +96,7 @@ def _validate_no_sleep_wake_overlap(
             models.UsersTargetWakingPeriod.target_end_time > start,
         ).first()
     elif record_type == "wake":
-        overlap = db.query(models.UsersRealSleepData.id).filter(
+        overlap = db.query(models.UsersRealSleepData).filter(
             models.UsersRealSleepData.user_id == user_id,
             models.UsersRealSleepData.is_active == True,
             models.UsersRealSleepData.deleted_at.is_(None),
@@ -107,12 +108,10 @@ def _validate_no_sleep_wake_overlap(
         raise ValueError(f"Unsupported record type: {record_type}")
 
     if overlap:
+        detail = overlap_detail(start, end, overlap.target_start_time, overlap.target_end_time, wake_id=overlap.id) if record_type == "sleep" else overlap_detail(overlap.sleep_start_time, overlap.sleep_end_time, start, end, sleep_id=overlap.id)
         raise HTTPException(
             status_code=400,
-            detail={
-                "message": "Sleep time and target wake time cannot overlap.",
-                "type": "sleep_wake_overlap",
-            },
+            detail=detail,
         )
 
 
@@ -193,16 +192,25 @@ def _validate_recommendation_prerequisites(user_id: UUID, db: Session):
         models.UsersTargetWakingPeriod.invalidated_at.is_(None),
     ).all()
 
-    for sleep in sleep_rows:
-        for wake in wake_rows:
-            if wake.target_start_time < sleep.sleep_end_time and wake.target_end_time > sleep.sleep_start_time:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "message": "Sleep time and target wake time cannot overlap.",
-                        "type": "sleep_wake_overlap",
-                    },
-                )
+    conflict = first_sleep_wake_overlap(
+        [(row.sleep_start_time, row.sleep_end_time) for row in sleep_rows],
+        [(row.target_start_time, row.target_end_time) for row in wake_rows],
+    )
+    if conflict is not None:
+        sleep, wake = sleep_rows[conflict[0]], wake_rows[conflict[1]]
+        raise HTTPException(400, detail=overlap_detail(
+            sleep.sleep_start_time, sleep.sleep_end_time, wake.target_start_time, wake.target_end_time,
+            sleep_id=sleep.id, wake_id=wake.id,
+        ))
+
+
+def _invalidate_future_recommendations(user_id, db):
+    db.query(RecommendationsCaffeine).filter(
+        RecommendationsCaffeine.user_id == user_id,
+        RecommendationsCaffeine.is_active.is_(True),
+        RecommendationsCaffeine.recommended_caffeine_intake_timing >= datetime.now(timezone.utc),
+    ).update({"is_active": False}, synchronize_session=False)
+    db.commit()
 
 
 # cors中間件
@@ -222,6 +230,7 @@ async def private_responses(request: Request, call_next):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-WakeMate-Validation"] = "sleep-wake-v2"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
@@ -239,6 +248,12 @@ async def validation_error(request: Request, error: RequestValidationError):
 def trigger_calculation(triggered_by: UUID):
     conn = None
     try:
+        with SessionLocal() as validation_db:
+            try:
+                _validate_recommendation_prerequisites(triggered_by, validation_db)
+            except HTTPException as error:
+                _invalidate_future_recommendations(triggered_by, validation_db)
+                return {"status": "blocked", "detail": error.detail}
         conn = get_db_connection()
         # 批次跑，內部會自動判斷每個 user_id 是否需要更新
         recommendation_result = run_caffeine_recommendation(conn, only_user_id=triggered_by)
@@ -891,6 +906,7 @@ def get_pvt_results(user_id: UUID = Depends(scoped_user_id), db: Session = Depen
 
 @protected.get("/recommendations/", response_model=list[schemas.RecommendationsCaffeine_DB_Response])
 def get_recommendations(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
+    _validate_recommendation_prerequisites(user_id, db)
     latest_source = (
         db.query(func.max(RecommendationsCaffeine.source_data_latest_at))
         .filter(RecommendationsCaffeine.user_id == user_id)
@@ -909,8 +925,14 @@ def get_recommendations(user_id: UUID = Depends(scoped_user_id), db: Session = D
 
 @protected.post("/calculate/")
 def calculate_recommendations(user_id: UUID = Depends(scoped_user_id), db: Session = Depends(get_db)):
-    _validate_recommendation_prerequisites(user_id, db)
+    try:
+        _validate_recommendation_prerequisites(user_id, db)
+    except HTTPException:
+        _invalidate_future_recommendations(user_id, db)
+        raise
     result = trigger_calculation(user_id)
+    if result["status"] == "blocked":
+        raise HTTPException(400, detail=result["detail"])
     if result["status"] != "ok":
         raise HTTPException(status_code=500, detail=result["message"])
     return result

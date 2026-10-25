@@ -4,6 +4,7 @@ from datetime import timedelta
 from psycopg2.extras import execute_values
 from typing import Dict, Optional
 from .baseline_rt import compute_baseline_rt
+from .period_validation import first_sleep_wake_overlap
 
 
 def _get_user_ids_for_alertness(cursor):
@@ -150,6 +151,8 @@ def run_alertness_data(conn, user_params_map: Optional[Dict] = None, *, only_use
             target_rows = cur.fetchall()
 
             if not sleep_rows or not target_rows:
+                continue
+            if first_sleep_wake_overlap(sleep_rows, target_rows) is not None:
                 continue
 
             # 只抓有效 real intake

@@ -4,6 +4,7 @@ from psycopg2.extras import execute_values
 from datetime import timedelta
 from typing import Dict, Optional
 from .baseline_rt import compute_baseline_rt
+from .period_validation import first_sleep_wake_overlap
 
 
 ALERTNESS_THRESHOLD = 270.0  # 目標上限（ms）
@@ -284,6 +285,33 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
             }
 
         for uid in user_ids:
+            cur.execute("""
+                SELECT user_id, target_start_time, target_end_time
+                FROM users_target_waking_period
+                WHERE user_id = %s
+                    AND is_active = TRUE
+                    AND deleted_at IS NULL
+                    AND invalidated_at IS NULL
+                ORDER BY target_start_time
+            """, (uid,))
+            waking_periods = cur.fetchall()
+
+            cur.execute("""
+                SELECT user_id, sleep_start_time, sleep_end_time
+                FROM users_real_sleep_data
+                WHERE user_id = %s
+                    AND is_active = TRUE
+                    AND deleted_at IS NULL
+                    AND invalidated_at IS NULL
+                ORDER BY sleep_start_time
+            """, (uid,))
+            sleep_rows = cur.fetchall()
+            if not sleep_rows or not waking_periods or first_sleep_wake_overlap(
+                [(r[1], r[2]) for r in sleep_rows], [(r[1], r[2]) for r in waking_periods]
+            ) is not None:
+                cur.execute("UPDATE recommendations_caffeine SET is_active = FALSE WHERE user_id = %s AND is_active = TRUE AND recommended_caffeine_intake_timing >= NOW()", (uid,))
+                conn.commit()
+                continue
             latest_source_ts = _get_latest_source_ts(cur, uid)
             last_processed_ts = _get_last_processed_ts_for_rec(cur, uid)
             if latest_source_ts <= last_processed_ts:
@@ -311,28 +339,6 @@ def run_caffeine_recommendation(conn, user_params_map: Optional[Dict] = None, *,
             )
 
             # 取該使用者資料
-            cur.execute("""
-                SELECT user_id, target_start_time, target_end_time
-                FROM users_target_waking_period
-                WHERE user_id = %s
-                    AND is_active = TRUE
-                    AND deleted_at IS NULL
-                    AND invalidated_at IS NULL
-                ORDER BY target_start_time
-            """, (uid,))
-            waking_periods = cur.fetchall()
-
-            cur.execute("""
-                SELECT user_id, sleep_start_time, sleep_end_time
-                FROM users_real_sleep_data
-                WHERE user_id = %s
-                    AND is_active = TRUE
-                    AND deleted_at IS NULL
-                    AND invalidated_at IS NULL
-                ORDER BY sleep_start_time
-            """, (uid,))
-            sleep_rows = cur.fetchall()
-
             # fetch actual intakes for this user once (used to initialize g_PD and to skip exact-time recommendations)
             cur.execute("""
                 SELECT taking_timestamp, caffeine_amount
