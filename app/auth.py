@@ -45,8 +45,8 @@ def unauthorized():
 
 
 def check_new_password(value):
-    if len(value) < 12 or len(value.encode("utf-8")) > 72:
-        raise HTTPException(422, "password_requires_12_characters_max_72_bytes")
+    if not value.strip() or len(value.encode("utf-8")) > 72:
+        raise HTTPException(422, "password_must_not_be_blank_max_72_bytes")
 
 
 def cleanup_expired_sessions(db):
@@ -166,7 +166,7 @@ class RefreshRequest(BaseModel):
 
 class PasswordChange(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
-    new_password: str = Field(min_length=12, max_length=72)
+    new_password: str = Field(min_length=1, max_length=72)
 
 
 @router.post("/users/", response_model=UserResponse)
@@ -210,7 +210,7 @@ def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
     user.last_login = now()
     session = AuthSession(user_id=user.user_id, created_at=now(),
                           refresh_expires_at=now() + SESSION_LIFETIME,
-                          password_change_required=len(password) < 12)
+                          password_change_required=not password.strip())
     return issue_pair(db, session, user)
 
 

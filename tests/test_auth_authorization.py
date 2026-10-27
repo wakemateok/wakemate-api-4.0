@@ -176,16 +176,16 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(session.refresh_hash, digest(self.pair["refresh_token"]))
         self.assertNotEqual(session.access_hash, self.pair["access_token"])
 
-    def test_existing_weak_password_requires_change_before_data_access(self):
+    def test_existing_blank_password_requires_change_before_data_access(self):
         user = self.db.query(models.User).filter_by(user_id=self.b).one()
-        user.hashed_password = self.passwords.hash("12345678")
+        user.hashed_password = self.passwords.hash(" " * 12)
         self.db.commit()
-        pair = self.login("b@example.com", "12345678")
+        pair = self.login("b@example.com", " " * 12)
         headers = {"Authorization": "Bearer " + pair["access_token"]}
         self.assertTrue(pair["password_change_required"])
         self.assertEqual(self.client.get("/users/", headers=headers).status_code, 403)
         response = self.client.post("/auth/change_password", headers=headers,
-            json={"current_password": "12345678", "new_password": PASSWORD})
+            json={"current_password": " " * 12, "new_password": PASSWORD})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(response.json()["password_change_required"])
         self.assertEqual(self.client.get("/users/", headers={"Authorization": "Bearer " + response.json()["access_token"]}).status_code, 200)
@@ -203,8 +203,8 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(results[-1].status_code, 429)
         self.assertIn("retry-after", results[-1].headers)
 
-    def test_registration_rejects_weak_password_and_is_atomic(self):
-        response = self.client.post("/users/", json={"name": "test", "email": "new@example.com", "password": "12345678"})
+    def test_registration_rejects_blank_password_and_is_atomic(self):
+        response = self.client.post("/users/", json={"name": "test", "email": "new@example.com", "password": "   "})
         self.assertEqual(response.status_code, 422)
         response = self.client.post("/users/", json={"name": "test", "email": "NEW@example.com", "password": PASSWORD})
         self.assertEqual(response.status_code, 200, response.text)
@@ -259,6 +259,37 @@ class AuthorizationTests(unittest.TestCase):
             response = self.client.post("/users/", json={
                 "name": "test", "email": "new@example.com", "password": password})
             self.assertEqual(response.status_code, 422)
+
+    def test_short_password_registration_login_and_change_preserve_authorization(self):
+        for index, password in enumerate(["a", "1234", "\u5bc6", " a ", "a" * 72]):
+            email = f"short{index}@example.com"
+            response = self.client.post("/users/", json={"name": "test", "email": email, "password": password})
+            self.assertEqual(response.status_code, 200, response.text)
+            pair = self.login(email, password)
+            self.assertFalse(pair["password_change_required"])
+            headers = {"Authorization": "Bearer " + pair["access_token"]}
+            self.assertEqual(self.client.get("/users/", headers=headers).status_code, 200)
+            self.assertEqual(self.client.get(f"/users/?user_id={self.a}", headers=headers).status_code, 403)
+            result = self.client.post("/auth/change_password", headers=headers,
+                json={"current_password": password, "new_password": "z"})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.login(email, "z")
+
+    def test_existing_short_password_is_not_forced_to_change_after_login(self):
+        user = self.db.query(models.User).filter_by(user_id=self.b).one()
+        user.hashed_password = self.passwords.hash("1234")
+        self.db.commit()
+        pair = self.login("b@example.com", "1234")
+        self.assertFalse(pair["password_change_required"])
+        self.assertEqual(self.client.get("/users/", headers={"Authorization": "Bearer " + pair["access_token"]}).status_code, 200)
+
+    def test_password_change_rejects_empty_blank_and_oversized_values(self):
+        for value in ["", " ", "\t\n", "\u3000", "a" * 73, "\u5bc6" * 25]:
+            result = self.client.post("/auth/change_password", headers=self.headers,
+                json={"current_password": PASSWORD, "new_password": value})
+            self.assertEqual(result.status_code, 422, result.text)
+        user = self.db.query(models.User).filter_by(user_id=self.a).one()
+        self.assertTrue(self.passwords.verify(PASSWORD, user.hashed_password))
 
     def test_unregistered_email_cannot_grant_any_role(self):
         response = self.client.post("/users/", json={"name": "test", "email": "new@example.com",
