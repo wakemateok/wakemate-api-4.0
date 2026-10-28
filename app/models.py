@@ -21,6 +21,7 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_login = Column(DateTime(timezone=True), nullable=True)
+    google_identity = relationship("GoogleIdentity", back_populates="user", uselist=False)
 
     # Relationships
     body_info = relationship("UsersBodyInfo", back_populates="user")
@@ -30,6 +31,14 @@ class User(Base):
     pvt_results = relationship("UsersPVTResults", back_populates="user")
     recommendations = relationship("RecommendationsCaffeine", back_populates="user")
     alertness_data = relationship("AlertnessDataForVisualization", back_populates="user")
+
+class GoogleIdentity(Base):
+    __tablename__ = "auth_google_identities"
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), primary_key=True)
+    subject = Column(String(255), nullable=False, unique=True, index=True)
+    linked_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    user = relationship("User", back_populates="google_identity")
+
 
 class AuthSession(Base):
     __tablename__ = "auth_sessions"

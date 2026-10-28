@@ -85,7 +85,13 @@ def consume_limit(db, category, identity, limit, seconds=900):
 
 def safe_user(user):
     return {"user_id": str(user.user_id), "name": user.name or "", "email": user.email,
-            "last_login": user.last_login}
+            "last_login": user.last_login,
+            "password_login_available": has_password_login(user),
+            "google_linked": user.google_identity is not None}
+
+
+def has_password_login(user):
+    return user is not None and passwords.identify(user.hashed_password or "") is not None
 
 
 def issue_pair(db, session, user):
@@ -201,7 +207,7 @@ def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
     valid = False
     if len(password.encode("utf-8")) <= 72:
         with _kdf_slots:
-            valid = passwords.verify(password, user.hashed_password if user else _DUMMY_HASH)
+            valid = passwords.verify(password, user.hashed_password if has_password_login(user) else _DUMMY_HASH)
     if user is None or not valid:
         raise HTTPException(401, "invalid_credentials", headers={"WWW-Authenticate": "Bearer"})
     if passwords.needs_update(user.hashed_password):
@@ -247,6 +253,8 @@ def logout(request: Request, user: User = Depends(get_current_user), db: Session
 def change_password(data: PasswordChange, request: Request, user: User = Depends(get_current_user),
                     db: Session = Depends(get_db)):
     consume_limit(db, "change-password", str(user.user_id), 5)
+    if not has_password_login(user):
+        raise HTTPException(400, "password_login_not_available")
     check_new_password(data.new_password)
     with _kdf_slots:
         valid = len(data.current_password.encode("utf-8")) <= 72 and passwords.verify(data.current_password, user.hashed_password)

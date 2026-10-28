@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4, UUID
 from .database import engine, SessionLocal, get_db
 from .auth import router as auth_router, enforce_data_owner, scoped_user_id, cleanup_expired_sessions
+from .google_login import router as google_login_router
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
@@ -42,6 +43,7 @@ from core.database import get_db_connection
 app = FastAPI()
 protected = APIRouter(dependencies=[Depends(enforce_data_owner)])
 app.include_router(auth_router)
+app.include_router(google_login_router)
 
 
 class QuestionnaireLinksResponse(BaseModel):
